@@ -40,6 +40,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from peekaboo import PEEKABOO_OWL, __version__
 from peekaboo.config import PeekabooConfig, PeekabooConfigParser
 from peekaboo.db import PeekabooDatabase
+from peekaboo.duplicates import DuplicateHandler
 from peekaboo.queuing import JobQueue
 from peekaboo.ruleset.engine import RulesetEngine
 from peekaboo.sample import SampleFactory
@@ -313,6 +314,12 @@ def run():
                            "interval to %d seconds.",
                            cldup_check_interval)
 
+    try:
+        duplicate_handler = DuplicateHandler(cldup_check_interval)
+    except PeekabooConfigException as error:
+        logging.critical(error)
+        sys.exit(1)
+
     # workers of the job queue need the ruleset configuration to create the
     # ruleset engine with it
     try:
@@ -335,7 +342,7 @@ def run():
     job_queue = JobQueue(
         worker_count=config.worker_count, ruleset_config=ruleset_config,
         db_con=db_con,
-        cluster_duplicate_check_interval=cldup_check_interval)
+        duplicate_handler=duplicate_handler)
 
     if config.cuckoo_mode == "embed":
         cuckoo = CuckooEmbed(job_queue, config.cuckoo_exec,
@@ -378,6 +385,7 @@ def run():
     finally:
         server.shutdown()
         job_queue.shut_down()
+        duplicate_handler.shut_down()
         try:
             db_con.clear_in_flight_samples()
             db_con.clear_stale_in_flight_samples()
