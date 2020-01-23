@@ -85,6 +85,36 @@ class PeekabooUtil(object):
 
         return outdata
 
+    def shutdown(self):
+        """ Send shutdown request to daemon """
+        logger.debug("Sending shutdown request...")
+        try:
+            shutting = self.send_receive_json([{"request": "shutdown"}])
+        except socket.error as error:
+            logger.error("Error communicating with daemon: %s", error)
+            return 2
+
+        if not isinstance(shutting, dict):
+            logger.error("Invalid response from daemon: %s", shutting)
+            return 2
+
+        reqtype = shutting.get('request')
+        response = shutting.get('response')
+        if reqtype is None or response is None:
+            logger.error("Incomplete response from daemon: %s", shutting)
+            return 2
+
+        if reqtype != 'shutdown':
+            logger.error("Response is not for shutdown request")
+            return 2
+
+        if response != 'ok':
+            logger.error("Shutdown refused")
+            return 1
+
+        logger.info('Shutdown triggered')
+        return 0
+
     def ping(self):
         """ Send ping request to daemon and optionally print response. """
         logger.debug("Sending ping...")
@@ -167,6 +197,10 @@ def main():
                                        'than once to scan multiple files.')
     scan_file_parser.set_defaults(func=command_scan_file)
 
+    shutdown_parser = subparsers.add_parser('shutdown',
+                                            help='Shut down the daemon')
+    shutdown_parser.set_defaults(func=command_shutdown)
+
     ping_parser = subparsers.add_parser('ping', help='Ping the daemon')
     ping_parser.set_defaults(func=command_ping)
 
@@ -199,6 +233,11 @@ def main():
 def command_scan_file(util, args):
     """ Handler for command scan_file """
     return util.scan_file(args.filename)
+
+
+def command_shutdown(util, _):
+    """ Handler for command shutdown """
+    return util.shutdown()
 
 
 def command_ping(util, _):

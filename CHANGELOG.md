@@ -20,7 +20,7 @@ See documentation for details.
   (#43)
 - Introduce peekaboo-util.py with subcommands scan-file (as a super charged
   replacement for scan\_file.py (#107)), ping and raw (for diagnosis, scripting
-  and debugging).
+  and debugging) and shutdown (for graceful shutdown of the daemon).
 - Add database indices to speed up processing and lower database CPU load.
   Rename analyses\_time column to analysis\_time in analysis\_jobs table.
   Raises schema version to 7. (#124)

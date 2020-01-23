@@ -361,7 +361,7 @@ def run():
     try:
         server = PeekabooServer(
             sock_file=config.sock_file, job_queue=job_queue,
-            sample_factory=sample_factory,
+            sample_factory=sample_factory, cuckoo=cuckoo,
             request_queue_size=config.worker_count * 2)
     except Exception as error:
         logger.critical('Failed to start Peekaboo Server: %s', error)

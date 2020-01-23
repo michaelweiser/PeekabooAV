@@ -42,11 +42,14 @@ logger = logging.getLogger(__name__)
 class PeekabooStreamServer(socketserver.ThreadingUnixStreamServer):
     """ Asynchronous server. """
     def __init__(self, server_address, request_handler_cls, job_queue,
-                 sample_factory, bind_and_activate=True,
+                 sample_factory, cuckoo, bind_and_activate=True,
                  request_queue_size=10, status_change_timeout=60):
         self.server_address = server_address
         self.__job_queue = job_queue
         self.__sample_factory = sample_factory
+        # FIXME: we only need the cuckoo object to tell it to shut down. See
+        # shutdown() below.
+        self.__cuckoo = cuckoo
         self.request_queue_size = request_queue_size
         self.allow_reuse_address = True
         self.status_change_timeout = status_change_timeout
@@ -100,6 +103,12 @@ class PeekabooStreamServer(socketserver.ThreadingUnixStreamServer):
             self.__request_triggers[thread].set()
 
         socketserver.ThreadingUnixStreamServer.shutdown(self)
+
+        # FIXME: This is spaghetti! Signal cuckoo module to shut down so the
+        # main loop exits. This should be inverted as soon as embed mode
+        # finally dies off, i.e. the frontend becoming the main loop and cuckoo
+        # just being a backend to the ruleset.
+        self.__cuckoo.shut_down()
 
     def server_close(self):
         """ Finally completely close down the server. """
@@ -236,7 +245,7 @@ class PeekabooStreamRequestHandler(socketserver.StreamRequestHandler):
 
             # default request type is scan-file
             reqtype = request.get('request', 'scan-file')
-            if reqtype not in ['scan-file', 'ping']:
+            if reqtype not in ['scan-file', 'ping', 'shutdown']:
                 self.talk_back(_('ERROR: Unsupported request %s') % reqtype)
                 logger.error('Unsupported request %s', reqtype)
                 return None
@@ -274,6 +283,11 @@ class PeekabooStreamRequestHandler(socketserver.StreamRequestHandler):
                 self.talk_back(json.dumps({'request': 'ping',
                                            'response': 'pong'}))
                 logger.debug('ping request received and answered')
+            elif reqtype == 'shutdown':
+                self.talk_back(json.dumps({'request': 'shutdown',
+                                           'response': 'ok'}))
+                logger.debug('shutdown request received, going down')
+                self.server.shutdown()
             else:
                 # paranoia
                 logger.error('Unknown request "%s" got through input '
@@ -433,7 +447,7 @@ class PeekabooStreamRequestHandler(socketserver.StreamRequestHandler):
 class PeekabooServer(object):
     """ A class wrapping the server components of Peekaboo. """
     def __init__(self, sock_file, job_queue, sample_factory,
-                 request_queue_size):
+                 cuckoo, request_queue_size):
         """ Initialise a new server and start it. All error conditions are
         returned as exceptions.
 
@@ -445,6 +459,8 @@ class PeekabooServer(object):
         @param sample_factory: A reference to a sample factory for creating new
                                samples.
         @type sample_factory: SampleFactory
+        @param cuckoo: A reference to a Cuckoo API object for shutdown.
+        @type cuckoo: Cuckoo
         @param request_queue_size: Number of requests that may be pending on
                                    the socket.
         @type request_queue_size: int
@@ -457,6 +473,7 @@ class PeekabooServer(object):
             PeekabooStreamRequestHandler,
             job_queue=job_queue,
             sample_factory=sample_factory,
+            cuckoo=cuckoo,
             request_queue_size=request_queue_size)
 
         self.runner = Thread(target=self.server.serve_forever, name="Server")
