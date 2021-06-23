@@ -12,6 +12,10 @@ See documentation for details.
 - Generic rules can now make use of the new analyser `knownreport`
 - Introduce cortexreport toolbox analyser to connect to Cortex by TheHive.
   There already are a few sub analysers that can be used.
+- The CortexAnalyser or more precisely every CortexAnalyser can now access
+  domain, hash, and ip artifacts from within the Generic rules.
+- FileInfoAnalyzerReport has new attibutes md5sum, sha256sum, and ssdeepsum
+  (now don't get to excited, ssdeep hashes can only be used as strings)
 
 ## 2.0
 
