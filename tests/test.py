@@ -1424,8 +1424,8 @@ unknown : baz'''
 
         report["full"]["results"][0]["results"][0]["submodule_section_content"]["md5"] = ""
         sample.register_cortex_report(cortexreport)
-        with self.assertRaises(TypeError):
-            result = rule.evaluate(sample)
+        result = rule.evaluate(sample)
+        self.assertEqual(result.result, Result.unknown)
 
 
     def test_rule_expressions_cortexreport_virustotalqueryreport_context(self):

@@ -63,3 +63,7 @@ class PeekabooAnalysisDeferred(PeekabooRulesetException):
     take into account that the ruleset will be rerun from the very beginning.
     """
     pass
+
+class PeekabooInvalidInputError(TypeError):
+    """ Used to signal that a value in a processed report is invalid. """
+    pass

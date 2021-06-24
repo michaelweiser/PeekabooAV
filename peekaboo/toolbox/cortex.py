@@ -36,7 +36,7 @@ import cortex4py.exceptions
 import requests.sessions
 import urllib3.util.retry
 
-from peekaboo.exceptions import PeekabooException
+from peekaboo.exceptions import PeekabooException, PeekabooInvalidInputError
 
 
 logger = logging.getLogger(__name__)
@@ -169,9 +169,10 @@ class FileInfoAnalyzerReport(CortexAnalyzerReport):
         hashes = self.get_hashes()
         sha256sum = hashes.get('sha256')
         if not isinstance(sha256sum, str):
-            raise TypeError('sha256 sum is expected to be a string')
+            raise PeekabooInvalidInputError('sha256 sum is expected to be a string')
         if len(sha256sum) != 64:
-            raise TypeError('sha256 sum string is expected to be 64 characters long')
+            raise PeekabooInvalidInputError('sha256 sum string is expected'
+                'to be 64 characters long')
 
         return sha256sum
 
@@ -181,9 +182,9 @@ class FileInfoAnalyzerReport(CortexAnalyzerReport):
         hashes = self.get_hashes()
         md5sum = hashes.get('md5')
         if not isinstance(md5sum, str):
-            raise TypeError('md5 sum is expected to be a string')
+            raise PeekabooInvalidInputError('md5 sum is expected to be a string')
         if len(md5sum) != 32:
-            raise TypeError('md5 sum string is expected to be 32 characters long')
+            raise PeekabooInvalidInputError('md5 sum string is expected to be 32 characters long')
 
         return md5sum
 
@@ -194,9 +195,10 @@ class FileInfoAnalyzerReport(CortexAnalyzerReport):
         hashes = self.get_hashes()
         ssdeepsum = hashes.get('ssdeep')
         if not isinstance(ssdeepsum, str):
-            raise TypeError('ssdeep sum is expected to be a string')
+            raise PeekabooInvalidInputError('ssdeep sum is expected to be a string')
         if len(ssdeepsum) > 148:
-            raise TypeError('ssdeep sum string is expected to less or equal to 148 characters long')
+            raise PeekabooInvalidInputError('ssdeep sum string is expected to'
+                'be less or equal to 148 characters long')
 
         return ssdeepsum
 

@@ -32,7 +32,7 @@ from peekaboo.ruleset import Result, RuleResult
 from peekaboo.ruleset.expressions import ExpressionParser, \
         IdentifierMissingException
 from peekaboo.exceptions import PeekabooAnalysisDeferred, \
-        PeekabooRulesetConfigError
+        PeekabooRulesetConfigError, PeekabooInvalidInputError
 from peekaboo.sample import Sample
 from peekaboo.toolbox.cuckoo import CuckooReport, CuckooSubmitFailedException
 from peekaboo.toolbox.ole import Oletools, OletoolsReport
@@ -743,6 +743,9 @@ class ExpressionRule(Rule):
                     identifier = missing.name
                 except CortexAnalyzerReportMissingException as missing:
                     cortex_analyzer = missing.analyzer
+                except PeekabooInvalidInputError as error:
+                    logger.error("Invalid input: %s", error)
+                    break
 
                 if identifier is not None:
                     result = self.resolve_identifier(
