@@ -43,23 +43,6 @@ from peekaboo.ruleset import Result
 logger = logging.getLogger(__name__)
 
 
-class SampleFactory:
-    """ A class for churning out loads of mostly identical sample objects.
-    Contains all the global configuration data and object references each
-    sample needs and thus serves as a registry of potential API breakage
-    perhaps deserving looking into. """
-    def __init__(self, processing_info_dir):
-        # configuration
-        self.processing_info_dir = processing_info_dir
-
-    def make_sample(self, content, name=None, content_type=None,
-                    content_disposition=None):
-        """ Create a new Sample object based on the factory's configured
-        defaults and variable parameters. """
-        return Sample(content, name, content_type, content_disposition,
-                      self.processing_info_dir)
-
-
 @enum.unique
 class JobState(enum.Enum):
     """ Enumeration of states a job processing some sample can be in. """
@@ -77,8 +60,7 @@ class Sample:
     such as the file checksum.
     """
     def __init__(self, content, filename=None, content_type=None,
-                 content_disposition=None,
-                 processing_info_dir=None, job_id=None):
+                 content_disposition=None, job_id=None):
         # we do neither need nor accept for path traversal attack avoidance
         # full paths
         if filename is not None:
@@ -102,7 +84,6 @@ class Sample:
         self.__report = []
         self.__sha256sum = None
         self.__file_extension = None
-        self.__processing_info_dir = processing_info_dir
 
     @property
     def filename(self):
@@ -179,71 +160,6 @@ class Sample:
         if res.result >= self.__result:
             self.__result = res.result
             self.__reason = res.reason
-
-    def dump_processing_info(self):
-        """
-        Saves the Cuckoo report as HTML + JSON
-        to a directory named after the job hash.
-        """
-        if not self.__processing_info_dir:
-            logger.debug('Not dumping processing info because no path for the '
-                         'data is unconfigured.')
-            return
-
-        now = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
-        dump_dir = os.path.join(
-            self.__processing_info_dir, "%s-%s" % (now, self.sha256sum))
-        if not os.path.isdir(dump_dir):
-            try:
-                os.makedirs(dump_dir, 0o770)
-            except OSError as oserr:
-                logger.error('Failed to create dump directory %s: %s',
-                             dump_dir, oserr)
-                return
-
-        logger.debug('%d: Dumping processing info to %s',
-                     self.__id, dump_dir)
-
-        # Peekaboo's report
-        peekaboo_report = os.path.join(dump_dir, 'report.txt')
-        try:
-            with open(peekaboo_report, 'w+') as pr_file:
-                pr_file.write('Declared file name: %s\n' % self.__filename)
-                pr_file.write(
-                    'Declared content type: %s\n' % self.__content_type)
-                pr_file.write(
-                    'Declared content disposition: %s\n' %
-                    self.__content_disposition)
-                if self.__report:
-                    pr_file.write('\n'.join(self.__report + [""]))
-        except (OSError, IOError) as error:
-            logger.error('Failure to write report file %s: %s',
-                         peekaboo_report, error)
-            return
-
-        # store malicious sample along with the reports
-        if self.__result == Result.bad:
-            sample_dump = os.path.join(dump_dir, 'sample.bin')
-            try:
-                with open(sample_dump, 'wb') as dump_file:
-                    dump_file.write(self.__content)
-            except (shutil.Error, IOError, OSError) as error:
-                logger.error('Failure to dump sample file to dump '
-                             'directory: %s', error)
-                return
-
-        # Cuckoo report
-        if self.__cuckoo_report:
-            cuckoo_report = os.path.join(dump_dir, 'cuckoo_report.json')
-            try:
-                with open(cuckoo_report, 'wb+') as cr_json_file:
-                    cr_json = json.dumps(self.__cuckoo_report.dump,
-                                         indent=1, ensure_ascii=True)
-                    cr_json_file.write(cr_json.encode('ascii'))
-            except (OSError, IOError) as error:
-                logger.error('Failure to dump json report to %s: %s',
-                             cuckoo_report, error)
-                return
 
     @property
     def sha256sum(self):

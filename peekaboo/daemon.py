@@ -36,14 +36,17 @@ import logging
 import signal
 import socket
 from argparse import ArgumentParser
+
+import ibmcloudant.cloudant_v1
+import ibm_cloud_sdk_core.authenticators
 from sdnotify import SystemdNotifier
 from sqlalchemy.exc import SQLAlchemyError
+
 from peekaboo import PEEKABOO_OWL, __version__
 from peekaboo.config import (
     PeekabooConfig, PeekabooConfigParser, PeekabooAnalyzerConfig)
 from peekaboo.db import PeekabooDatabase
 from peekaboo.queuing import JobQueue
-from peekaboo.sample import SampleFactory
 from peekaboo.server import PeekabooServer
 from peekaboo.exceptions import (
     PeekabooDatabaseError, PeekabooConfigException)
@@ -318,6 +321,14 @@ def run():
     loop = asyncio.get_event_loop()
     sig_handler = SignalHandler(loop)
 
+    if config.pi_url and config.pi_db:
+        logger.debug("Creating CouchDB client for %s/%s",
+                     config.pi_url, config.pi_db)
+        pi_client = ibmcloudant.cloudant_v1.CloudantV1(
+            ibm_cloud_sdk_core.authenticators.BasicAuthenticator(
+                config.pi_user, config.pi_password))
+        pi_client.set_service_url(config.pi_url)
+
     # read in the analyzer and ruleset configuration and start the job queue
     try:
         ruleset_config = PeekabooConfigParser(config.ruleset_config)
@@ -325,24 +336,18 @@ def run():
         job_queue = JobQueue(
             worker_count=config.worker_count, ruleset_config=ruleset_config,
             db_con=db_con, analyzer_config=analyzer_config,
-            cluster_duplicate_check_interval=cldup_check_interval)
+            cluster_duplicate_check_interval=cldup_check_interval,
+            pi_client=pi_client, pi_db=config.pi_db)
         sig_handler.register_listener(job_queue)
         job_queue.start()
     except PeekabooConfigException as error:
         logging.critical(error)
         sys.exit(1)
 
-    # Factory producing almost identical samples providing them with global
-    # config values and references to other objects they need, such as database
-    # connection and connection map.
-    sample_factory = SampleFactory(
-        config.processing_info_dir)
-
     try:
         server = PeekabooServer(
             host=config.host, port=config.port,
             job_queue=job_queue,
-            sample_factory=sample_factory,
             request_queue_size=100,
             db_con=db_con)
     except Exception as error:

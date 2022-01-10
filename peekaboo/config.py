@@ -371,11 +371,14 @@ class PeekabooConfig(PeekabooConfigParser):
         self.log_format = '%(asctime)s - %(name)s - (%(threadName)s) - ' \
                           '%(levelname)s - %(message)s'
         self.worker_count = 3
-        self.processing_info_dir = '/var/lib/peekaboo/malware_reports'
         self.report_locale = None
         self.db_url = 'sqlite:////var/lib/peekaboo/peekaboo.db'
         self.db_async_driver = None
         self.db_log_level = logging.WARNING
+        self.pi_url = 'http://127.0.0.1:5984'
+        self.pi_db = 'peekaboo'
+        self.pi_user = 'peekaboo'
+        self.pi_password = 'P@ssw0rd'
         self.config_file = '/opt/peekaboo/etc/peekaboo.conf'
         self.ruleset_config = '/opt/peekaboo/etc/ruleset.conf'
         self.analyzer_config = '/opt/peekaboo/etc/analyzers.conf'
@@ -396,11 +399,14 @@ class PeekabooConfig(PeekabooConfigParser):
             'host': ['global', 'host'],
             'port': ['global', 'port'],
             'worker_count': ['global', 'worker_count'],
-            'processing_info_dir': ['global', 'processing_info_dir'],
             'report_locale': ['global', 'report_locale'],
             'db_url': ['db', 'url'],
             'db_async_driver': ['db', 'async_driver'],
             'db_log_level': ['db', 'log_level', self.LOG_LEVEL],
+            'pi_url': ['processing_info', 'url'],
+            'pi_db': ['processing_info', 'db'],
+            'pi_user': ['processing_info', 'user'],
+            'pi_password': ['processing_info', 'password'],
             'ruleset_config': ['ruleset', 'config'],
             'analyzer_config': ['analyzers', 'config'],
             'cluster_instance_id': ['cluster', 'instance_id'],

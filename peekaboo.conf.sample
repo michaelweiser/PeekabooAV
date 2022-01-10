@@ -15,7 +15,6 @@
 # daemon mode
 #pid_file         :    <empty>
 #worker_count     :    3
-#processing_info_dir : /var/lib/peekaboo/malware_reports
 
 # Configure the language to use for messages in the report returned to the
 # client. If unset, falls back to system configuration using environment
@@ -64,6 +63,12 @@
 # own logging. Can be considered another set of debug logging even beyond
 # Peekaboo's DEBUG log level.
 #log_level        :    WARNING
+
+[processing_info]
+#url: http://127.0.0.1:5984
+#db: peekaboo
+#user: peekaboo
+#password: P@ssw0rd
 
 [cluster]
 # if multiple instances are to run in parallel and avoid concurrent analysis of

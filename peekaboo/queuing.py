@@ -25,10 +25,13 @@
 """ The main job queue and worker threads. """
 
 
+import base64
 import logging
 import queue
 import threading
 import time
+
+import ibmcloudant.cloudant_v1
 
 from peekaboo.ruleset import Result, RuleResult
 from peekaboo.ruleset.engine import RulesetEngine
@@ -43,7 +46,8 @@ class JobQueue:
     """ Peekaboo's queuing system. """
     def __init__(self, ruleset_config, db_con, analyzer_config, worker_count=4,
                  queue_timeout=300, shutdown_timeout=60,
-                 cluster_duplicate_check_interval=5):
+                 cluster_duplicate_check_interval=5,
+                 pi_client=None, pi_db=None):
         """ Initialise job queue by creating n Peekaboo worker threads to
         process samples.
 
@@ -95,7 +99,8 @@ class JobQueue:
         # state.
         for wno in range(0, self.worker_count):
             logger.debug("Create Worker %d", wno)
-            worker = Worker(wno, self, self.ruleset_engine, db_con)
+            worker = Worker(wno, self, self.ruleset_engine, db_con,
+                            pi_client, pi_db)
             self.workers.append(worker)
 
         logger.info('Created %d Workers.', self.worker_count)
@@ -404,7 +409,8 @@ class ClusterDuplicateHandler(threading.Thread):
 
 class Worker(threading.Thread):
     """ A Worker thread to process a sample. """
-    def __init__(self, wid, job_queue, ruleset_engine, db_con):
+    def __init__(self, wid, job_queue, ruleset_engine, db_con,
+                 pi_client, pi_db):
         # whether we should run
         self.shutdown_requested = threading.Event()
         self.shutdown_requested.clear()
@@ -412,6 +418,13 @@ class Worker(threading.Thread):
         self.job_queue = job_queue
         self.ruleset_engine = ruleset_engine
         self.db_con = db_con
+        self.pi_client = pi_client
+        self.pi_db = pi_db
+
+        if not self.pi_client or not self.pi_db:
+            logger.debug('Disabling dumping processing info because no '
+                         'database is configured')
+
         super().__init__(name="Worker-%d" % wid)
 
     def run(self):
@@ -446,7 +459,7 @@ class Worker(threading.Thread):
                 continue
 
             if sample.result >= Result.failed:
-                sample.dump_processing_info()
+                self.dump_processing_info(sample)
 
             sample.mark_done()
 
@@ -461,6 +474,34 @@ class Worker(threading.Thread):
             self.job_queue.done(sample)
 
         logger.info('Worker %d: Stopped', self.worker_id)
+
+    def dump_processing_info(self, sample):
+        """ Save processing info to an external data store for reference. """
+        logger.debug('%d: Dumping processing info to database %s/%s',
+                     sample.id, self.pi_client.service_url, self.pi_db)
+
+        # Peekaboo's report
+        processing_info = {
+            'report': sample.peekaboo_report,
+        }
+
+        if sample.result == Result.bad:
+            processing_info['sample'] = base64.b64encode(
+                sample.content).decode('ascii')
+        if sample.cuckoo_report:
+            processing_info['cuckoo'] = sample.cuckoo_report.dump
+        #if sample.cortex_report:
+        #    processing_info['cortex'] = sample.cortex_report
+        #if sample.filetools_report:
+        #    processing_info['filetools'] = sample.filetools_report
+        #if sample.oletools_report:
+        #    processing_info['oletools'] = sample.oletools_report
+        #if sample.knowntools_report:
+        #    processing_info['knowntools'] = sample.knowntools_report
+
+        doc = ibmcloudant.cloudant_v1.Document(
+            id="%s" % sample.id, **processing_info)
+        self.pi_client.post_document(db=self.pi_db, document=doc)
 
     def shut_down(self):
         """ Asynchronously initiate worker shutdown. """

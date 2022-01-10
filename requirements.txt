@@ -1,3 +1,4 @@
+ibmcloudant
 sqlalchemy[asyncio]>=1.4.24
 python-magic>=0.4.17
 oletools>=0.54
