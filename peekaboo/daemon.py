@@ -37,14 +37,16 @@ import logging
 import signal
 import socket
 from argparse import ArgumentParser
+
+import aiocouch
 from sdnotify import SystemdNotifier
 from sqlalchemy.exc import SQLAlchemyError
+
 from peekaboo import PEEKABOO_OWL, __version__
 from peekaboo.config import (
     PeekabooConfig, PeekabooConfigParser, PeekabooAnalyzerConfig)
 from peekaboo.db import PeekabooDatabase
 from peekaboo.queuing import JobQueue
-from peekaboo.sample import SampleFactory
 from peekaboo.server import PeekabooServer
 from peekaboo.exceptions import (
     PeekabooDatabaseError, PeekabooConfigException)
@@ -329,6 +331,25 @@ async def async_main():
     threadpool = concurrent.futures.ThreadPoolExecutor(
         config.worker_count, 'ThreadPool-')
 
+    pi_client = None
+    pi_db = None
+    if config.pi_url and config.pi_db:
+        logger.debug("Creating CouchDB client for %s/%s",
+                     config.pi_url, config.pi_db)
+        pi_client = aiocouch.CouchDB(
+            config.pi_url, config.pi_user, config.pi_password)
+        try:
+            await pi_client.check_credentials()
+        except aiocouch.UnauthorizedError:
+            logger.error(
+                "Unauthorized when trying to access processing info "
+                "database at %s. Check credentials and permissions.",
+                config.pi_url)
+            await pi_client.close()
+            sys.exit(1)
+
+        pi_db = await pi_client.create(config.pi_db, exists_ok=True)
+
     # collect a list of awaitables from started subsystems from which to gather
     # unexpected error conditions such as exceptions
     awaitables = []
@@ -341,26 +362,21 @@ async def async_main():
             worker_count=config.worker_count, ruleset_config=ruleset_config,
             db_con=db_con, analyzer_config=analyzer_config,
             cluster_duplicate_check_interval=cldup_check_interval,
-            threadpool=threadpool)
+            threadpool=threadpool, pi_db=pi_db)
         sig_handler.register_listener(job_queue)
         awaitables.extend(await job_queue.start())
     except PeekabooConfigException as error:
         logging.critical(error)
+        if pi_client is not None:
+            await pi_client.close()
         sys.exit(1)
-
-    # Factory producing almost identical samples providing them with global
-    # config values and references to other objects they need, such as database
-    # connection and connection map.
-    sample_factory = SampleFactory(
-        config.processing_info_dir, threadpool)
 
     try:
         server = PeekabooServer(
             host=config.host, port=config.port,
             job_queue=job_queue,
-            sample_factory=sample_factory,
             request_queue_size=100,
-            db_con=db_con)
+            db_con=db_con, threadpool=threadpool)
         sig_handler.register_listener(server)
         # the server runs completely inside the event loop and does not expose
         # any awaitable to extract exceptions from.
@@ -369,6 +385,8 @@ async def async_main():
         logger.critical('Failed to start Peekaboo Server: %s', error)
         job_queue.shut_down()
         await job_queue.close_down()
+        if pi_client is not None:
+            await pi_client.close()
         sys.exit(1)
 
     # abort startup if shutdown was requested meanwhile
@@ -395,6 +413,9 @@ async def async_main():
     # close down components after they've shut down
     await server.close_down()
     await job_queue.close_down()
+
+    if pi_client is not None:
+        await pi_client.close()
 
     # do a final cleanup pass through the database
     try:

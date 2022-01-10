@@ -35,30 +35,10 @@ import shutil
 import string
 import logging
 import tempfile
-import aiofiles
-import aiofiles.os
 from peekaboo.ruleset import Result
 
 
 logger = logging.getLogger(__name__)
-
-
-class SampleFactory:
-    """ A class for churning out loads of mostly identical sample objects.
-    Contains all the global configuration data and object references each
-    sample needs and thus serves as a registry of potential API breakage
-    perhaps deserving looking into. """
-    def __init__(self, processing_info_dir, threadpool):
-        # configuration
-        self.processing_info_dir = processing_info_dir
-        self.threadpool = threadpool
-
-    def make_sample(self, content, name=None, content_type=None,
-                    content_disposition=None):
-        """ Create a new Sample object based on the factory's configured
-        defaults and variable parameters. """
-        return Sample(content, name, content_type, content_disposition,
-                      self.processing_info_dir, threadpool=self.threadpool)
 
 
 @enum.unique
@@ -78,8 +58,7 @@ class Sample:
     such as the file checksum.
     """
     def __init__(self, content, filename=None, content_type=None,
-                 content_disposition=None,
-                 processing_info_dir=None, job_id=None, threadpool=None):
+                 content_disposition=None, job_id=None, threadpool=None):
         # we do neither need nor accept for path traversal attack avoidance
         # full paths
         if filename is not None:
@@ -103,7 +82,6 @@ class Sample:
         self.__report = []
         self.__sha256sum = None
         self.__file_extension = None
-        self.__processing_info_dir = processing_info_dir
         self.__threadpool = threadpool
 
     @property
@@ -181,80 +159,6 @@ class Sample:
         if res.result >= self.__result:
             self.__result = res.result
             self.__reason = res.reason
-
-    async def dump_processing_info(self):
-        """
-        Saves the Cuckoo report as HTML + JSON
-        to a directory named after the job hash.
-        """
-        if not self.__processing_info_dir:
-            logger.debug('Not dumping processing info because no path for the '
-                         'data is unconfigured.')
-            return
-
-        now = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
-        dump_dir = os.path.join(
-            self.__processing_info_dir, "%s-%s" % (now, await self.sha256sum))
-        if not await aiofiles.os.path.isdir(
-                dump_dir, executor=self.__threadpool):
-            try:
-                await aiofiles.os.makedirs(
-                    dump_dir, 0o770, executor=self.__threadpool)
-            except OSError as oserr:
-                logger.error('Failed to create dump directory %s: %s',
-                             dump_dir, oserr)
-                return
-
-        logger.debug('%d: Dumping processing info to %s',
-                     self.__id, dump_dir)
-
-        # Peekaboo's report
-        peekaboo_report = os.path.join(dump_dir, 'report.txt')
-        try:
-            async with aiofiles.open(
-                    peekaboo_report, 'w+',
-                    executor=self.__threadpool) as pr_file:
-                await pr_file.write(
-                    'Declared file name: %s\n' % self.__filename)
-                await pr_file.write(
-                    'Declared content type: %s\n' % self.__content_type)
-                await pr_file.write(
-                    'Declared content disposition: %s\n' %
-                    self.__content_disposition)
-                if self.__report:
-                    await pr_file.write('\n'.join(self.__report + [""]))
-        except (OSError, IOError) as error:
-            logger.error('Failure to write report file %s: %s',
-                         peekaboo_report, error)
-            return
-
-        # store malicious sample along with the reports
-        if self.__result == Result.bad:
-            sample_dump = os.path.join(dump_dir, 'sample.bin')
-            try:
-                async with aiofiles.open(
-                        sample_dump, 'wb',
-                        executor=self.__threadpool) as dump_file:
-                    await dump_file.write(self.__content)
-            except (shutil.Error, IOError, OSError) as error:
-                logger.error('Failure to dump sample file to dump '
-                             'directory: %s', error)
-                return
-
-        # Cuckoo report
-        if self.__cuckoo_report:
-            cuckoo_report = os.path.join(dump_dir, 'cuckoo_report.json')
-            try:
-                async with aiofiles.open(
-                        cuckoo_report, 'wb+',
-                        executor=self.__threadpool) as cr_json_file:
-                    cr_json = json.dumps(self.__cuckoo_report.dump,
-                                         indent=1, ensure_ascii=True)
-                    await cr_json_file.write(cr_json.encode('ascii'))
-            except (OSError, IOError) as error:
-                logger.error('Failure to dump json report to %s: %s',
-                             cuckoo_report, error)
-                return
 
     def __sha256sum_internal(self):
         """ Actual calculation of the SHA256 checksum called by wrapper

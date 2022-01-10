@@ -26,7 +26,10 @@
 
 
 import asyncio
+import base64
 import logging
+
+import aiocouch
 
 from peekaboo.ruleset import Result, RuleResult
 from peekaboo.ruleset.engine import RulesetEngine
@@ -41,7 +44,7 @@ class JobQueue:
     """ Peekaboo's queuing system. """
     def __init__(self, ruleset_config, db_con, analyzer_config,
                  worker_count=4, cluster_duplicate_check_interval=5,
-                 threadpool=None):
+                 threadpool=None, pi_db=None):
         """ Initialise job queue by creating n Peekaboo workers to process
         samples.
 
@@ -63,6 +66,10 @@ class JobQueue:
         self.workers = []
         self.worker_count = worker_count
         self.threadpool = threadpool
+        self.pi_db = pi_db
+        if not self.pi_db:
+            logger.debug('Disabling dumping processing info because no '
+                         'database is configured')
 
         # keep a backlog of samples with hashes identical to samples currently
         # in analysis to avoid analysing multiple identical samples
@@ -85,7 +92,7 @@ class JobQueue:
         # state.
         for wno in range(0, self.worker_count):
             logger.debug("Create Worker %d", wno)
-            worker = Worker(wno, self, self.ruleset_engine, db_con)
+            worker = Worker(wno, self, self.ruleset_engine, db_con, pi_db)
             self.workers.append(worker)
 
         logger.info('Created %d Workers.', self.worker_count)
@@ -391,7 +398,7 @@ class ClusterDuplicateHandler:
 
 class Worker:
     """ A Worker to process a sample. """
-    def __init__(self, wid, job_queue, ruleset_engine, db_con):
+    def __init__(self, wid, job_queue, ruleset_engine, db_con, pi_db):
         # whether we should run
         self.task = None
         self.worker_id = wid
@@ -399,6 +406,7 @@ class Worker:
         self.job_queue = job_queue
         self.ruleset_engine = ruleset_engine
         self.db_con = db_con
+        self.pi_db = pi_db
 
     async def start(self):
         self.task = asyncio.ensure_future(self.run())
@@ -430,7 +438,7 @@ class Worker:
                 continue
 
             if sample.result >= Result.failed:
-                await sample.dump_processing_info()
+                await self.dump_processing_info(sample)
 
             sample.mark_done()
 
@@ -443,6 +451,46 @@ class Worker:
                 # no showstopper, we can limp on without caching in DB
 
             await self.job_queue.done(sample)
+
+    async def dump_processing_info(self, sample):
+        """ Save processing info to an external data store for reference. """
+        if self.pi_db is None:
+            return
+
+        logger.debug('%d: Dumping processing info', sample.id)
+
+        # Peekaboo's report
+        processing_info = {
+            'report': sample.peekaboo_report,
+        }
+
+        if sample.result == Result.bad:
+            processing_info['sample'] = base64.b64encode(
+                sample.content).decode('ascii')
+        if sample.cuckoo_report:
+            processing_info['cuckoo'] = sample.cuckoo_report.dump
+        #if sample.cortex_report:
+        #    processing_info['cortex'] = sample.cortex_report
+        #if sample.filetools_report:
+        #    processing_info['filetools'] = sample.filetools_report
+        #if sample.oletools_report:
+        #    processing_info['oletools'] = sample.oletools_report
+        #if sample.knowntools_report:
+        #    processing_info['knowntools'] = sample.knowntools_report
+
+        try:
+            doc = await self.pi_db.create(f"{sample.id}", data=processing_info)
+        except aiocouch.ConflictError:
+            logger.warning("%d: Failed to dump processing info because "
+                           "document already exists", sample.id)
+            return
+
+        try:
+            await doc.save()
+        except ConflictError as conflict:
+            logger.warning("%d: Saving of processing info failed with "
+                           "unexpected conflict: %s", sample.id, conflict)
+            return
 
     def shut_down(self):
         """ Asynchronously initiate worker shutdown. """

@@ -35,13 +35,14 @@ import sanic.headers
 import sanic.response
 
 from peekaboo.db import PeekabooDatabaseError
+from peekaboo.sample import Sample
 
 logger = logging.getLogger(__name__)
 
 class PeekabooServer:
     """ A class wrapping the server components of Peekaboo. """
-    def __init__(self, host, port, job_queue, sample_factory,
-                 request_queue_size, db_con):
+    def __init__(self, host, port, job_queue, request_queue_size, db_con,
+                 threadpool=None):
         """ Initialise a new server and start it. All error conditions are
         returned as exceptions.
 
@@ -52,9 +53,6 @@ class PeekabooServer:
         @param job_queue: A reference to the job queue for submission of
                           samples.
         @type job_queue: JobQueue
-        @param sample_factory: A reference to a sample factory for creating new
-                               samples.
-        @type sample_factory: SampleFactory
         @param request_queue_size: Number of requests that may be pending on
                                    the socket.
         @type request_queue_size: int
@@ -73,8 +71,8 @@ class PeekabooServer:
             asyncio_server_kwargs=dict(start_serving=False))
         self.server = None
         self.job_queue = job_queue
-        self.sample_factory = sample_factory
         self.db_con = db_con
+        self.threadpool = threadpool
         # remember for diagnostics
         self.host = host
         self.port = port
@@ -215,9 +213,8 @@ class PeekabooServer:
 
         file_content = form_part[line_index:-4]
         content_disposition = request.headers.get('x-content-disposition')
-        sample = self.sample_factory.make_sample(
-            file_content, file_name,
-            content_type, content_disposition)
+        sample = Sample(file_content, file_name, content_type,
+                        content_disposition, threadpool=self.threadpool)
 
         try:
             await self.db_con.analysis_add(sample)
