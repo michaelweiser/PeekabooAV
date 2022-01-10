@@ -26,7 +26,6 @@
 
 
 import asyncio
-import base64
 import logging
 
 import aiocouch
@@ -464,9 +463,6 @@ class Worker:
             'report': sample.peekaboo_report,
         }
 
-        if sample.result == Result.bad:
-            processing_info['sample'] = base64.b64encode(
-                sample.content).decode('ascii')
         if sample.cuckoo_report:
             processing_info['cuckoo'] = sample.cuckoo_report.dump
         #if sample.cortex_report:
@@ -491,6 +487,15 @@ class Worker:
             logger.warning("%d: Saving of processing info failed with "
                            "unexpected conflict: %s", sample.id, conflict)
             return
+
+        # attach the sample in case it is malware
+        if sample.result == Result.bad:
+            attachment = doc.attachment("sample")
+            # do not use client-supplied content type here to avoid attampts of
+            # confusing CouchDB. Instead we simply save some bytes here and
+            # metadata such as the content type claimed by the client is part
+            # of the report.
+            await attachment.save(sample.content, "application/octet-stream")
 
     def shut_down(self):
         """ Asynchronously initiate worker shutdown. """
