@@ -200,7 +200,7 @@ class Cuckoo:
         if (job_id in self.running_jobs and
                 self.running_jobs[job_id] is not sample):
             logger.warning(
-                '%d: A job with ID %d already registered as running '
+                '%s: A job with ID %d already registered as running '
                 'for different sample %d will be marked failed',
                 sample.id, job_id,
                 self.running_jobs[job_id].sample.id)
@@ -243,7 +243,7 @@ class Cuckoo:
             logger.debug('No sample found for job ID %d', job_id)
             return None
 
-        logger.debug('%d: Requesting Cuckoo report', sample.id)
+        logger.debug('%s: Requesting Cuckoo report', sample.id)
         report_path = "tasks/report/%d" % job_id
         report = await self.get(report_path)
         if report is None:

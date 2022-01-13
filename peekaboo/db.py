@@ -22,128 +22,49 @@
 #                                                                             #
 ###############################################################################
 
-""" A class wrapping database operations needed by Peekaboo based on
-SQLAlchemy. """
+""" A class wrapping database operations needed by Peekaboo.  """
 
 import asyncio
-import random
+import datetime
 import logging
-from datetime import datetime, timedelta
-from sqlalchemy import Column, Integer, String, Text, DateTime, \
-        Enum, Index
-import sqlalchemy.sql.expression
-import sqlalchemy.ext.asyncio
-import sqlalchemy.pool
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.engine import create_engine
-from sqlalchemy.orm import sessionmaker, scoped_session
-from sqlalchemy.exc import SQLAlchemyError, IntegrityError, OperationalError, \
-        DBAPIError
-from peekaboo import __version__
-from peekaboo.ruleset import Result
-from peekaboo.sample import JobState
-from peekaboo.exceptions import PeekabooDatabaseError
+import uuid
 
-DB_SCHEMA_VERSION = 9
+import aiocouch
+import aiohttp
+import tenacity
+
+from .ruleset import Result
+from .sample import JobState
+from .exceptions import PeekabooDatabaseError
 
 logger = logging.getLogger(__name__)
-Base = declarative_base()
 
 
-#
-# Database schema definition.
-##############################################################################
+def retry_if_connection_refused(retry_state):
+    exception = retry_state.outcome.exception()
+    return (isinstance(exception, aiohttp.ClientConnectionError) and
+            isinstance(exception.os_error, ConnectionRefusedError))
 
 
-class InFlightSample(Base):
-    """
-    Table tracking whether a specific sample is currently being analysed and by
-    which Peekaboo instance.
-    """
-    __tablename__ = 'in_flight_samples_v%d' % DB_SCHEMA_VERSION
-
-    # Indices:
-    # - general considerations: The table will likely never have more than a
-    #   couple of hundret entries. But we add and delete quite frequently.
-    # - uniqueness of the primary key ensures atomic insertion when adding a
-    #   lock
-    # - column: we delete our own stale locks by instance_id.
-    # - column: we delete other's stale locks by start_time.
-    # - compound: we delete our own locks by sha256sum and instance_id.
-    #   (admittedly a bit of overkill since the individual columns are already
-    #   indexed.)
-
-    sha256sum = Column(String(64), primary_key=True)
-    instance_id = Column(Integer, nullable=False, index=True)
-    start_time = Column(DateTime, nullable=False, index=True)
-
-    __table_args__ = (
-        # Index names need to be unique per schema in postgresql.
-        Index('ix_%s_sha_iid' % __tablename__, sha256sum, instance_id),
-        )
-
-    def __str__(self):
-        return (
-            '<InFlightSample(sha256sum="%s", instance_id="%s", '
-            'start_time="%s")>'
-            % (self.sha256sum,
-               self.instance_id,
-               self.start_time.strftime("%Y%m%dT%H%M%S"))
-        )
-
-    __repr__ = __str__
-
-
-class SampleInfo(Base):
-    """ Definition of the sample_info table. """
-    __tablename__ = 'sample_info_v%d' % DB_SCHEMA_VERSION
-
-    # Indices:
-    # - general considerations: The table grows very large over time. Every
-    #   sample is checked against it to find a cached analysis result.
-    #   Otherwise it's quite unused currently.
-    # - compound: we fetch the analsysis journal by id, state, result,
-    #   sha256sum and file extension
-
-    id = Column(Integer, primary_key=True)
-    state = Column(Enum(JobState), nullable=False)
-    sha256sum = Column(String(64), nullable=False)
-    file_extension = Column(String(16), nullable=True)
-    analysis_time = Column(DateTime, nullable=False,
-                           index=True)
-    result = Column(Enum(Result), nullable=False)
-    reason = Column(Text, nullable=True)
-
-    __table_args__ = (
-        Index('ix_%s_id_st_re_sha_fe' % __tablename__,
-              id, state, result, sha256sum, file_extension),
-    )
-
-    def __str__(self):
-        return ('<SampleInfo(sample_sha256_hash="%s", file_extension="%s", '
-                'reason="%s", analysis_time="%s")>'
-                % (self.sha256sum,
-                   self.file_extension,
-                   self.reason,
-                   self.analysis_time.strftime("%Y%m%dT%H%M%S")))
-
-    __repr__ = __str__
-
-
-#
-# End of database schema definition.
-##############################################################################
+def log_retry(retry_state):
+    """ Log a warning message on retries of requests. """
+    exception = retry_state.outcome.exception()
+    wait = retry_state.next_action.sleep
+    logger.log(logging.WARNING, '%s. Retrying in %.2f seconds.',
+               exception, wait)
 
 
 class PeekabooDatabase:
     """ Peekaboo's database. """
-    def __init__(self, db_url, instance_id=0,
-                 stale_in_flight_threshold=15*60,
-                 log_level=logging.WARNING):
+    def __init__(self, url, db_prefix, user, password, instance_id=0,
+                 stale_in_flight_threshold=15*60):
         """
         Initialize the Peekaboo database handler.
 
-        @param db_url: An RFC 1738 URL that points to the database.
+        @param url: An RFC 1738 URL that points to the couchdb instance.
+        @param db_prefix: Prefix for database names.
+        @param user: Name of the user to connect as.
+        @param password: Passwort to use for connection.
         @param instance_id: A positive, unique ID differentiating this Peekaboo
                             instance from any other instance using the same
                             database for concurrency coordination. Value of 0
@@ -151,172 +72,84 @@ class PeekabooDatabase:
                             to worry about.
         @param stale_in_flight_threshold: Number of seconds after which a in
         flight marker is considered stale and deleted or ignored.
-        @param log_level: Overrides the log level of the database modules. The
-                          idea is for the database to be silent by default and
-                          only emit log messages if switched on explictly and
-                          independently of the Peekaboo log level.
         """
-        logging.getLogger('sqlalchemy.engine').setLevel(log_level)
-        logging.getLogger('sqlalchemy.pool').setLevel(log_level)
-        # aiosqlite picks up the global log level unconditionally so we need to
-        # override it as well and explicitly
-        logging.getLogger('aiosqlite').setLevel(log_level)
-
-        # <backend>[+<driver>]:// -> <backend>
-        url_parts = db_url.split(':')
-        scheme_parts = url_parts[0].split('+')
-        backend = scheme_parts[0]
-
-        engine_kwargs = {}
-        if backend == 'sqlite':
-            engine_kwargs.update(dict(
-                poolclass=sqlalchemy.pool.AsyncAdaptedQueuePool,
-                pool_size=1, max_overflow=0, connect_args={'timeout': 0}))
-
-        # if there is no driver specified or its a known non-asyncio driver,
-        # try to find to a known-good asyncio driver
-        sync_drivers = {
-            'sqlite': ['pysqlite'],
-            'mysql': ['mysqldb', 'pymysql'],
-            'postgresql': [
-                'psycopg2', 'pg8000', 'psycopg2cffi', 'pypostgresql',
-                'pygresql'],
-        }
-
-        asyncio_drivers = {
-            'sqlite': ['aiosqlite'],
-            'mysql': ['asyncmy', 'aiomysql'],
-            'postgresql': ['asyncpg'],
-        }
-
-        backend_async_drivers = asyncio_drivers.get(backend)
-
-        # if there seems to be a driver specified, look more closely
-        if len(scheme_parts) > 1:
-            driver = scheme_parts[1]
-
-            backend_sync_drivers = sync_drivers.get(backend)
-            if (backend_sync_drivers is not None and
-                    driver in backend_sync_drivers):
-                logger.warning(
-                    'Configuration specifies a synchronous database driver '
-                    '"%s". Please update your configuration to use an '
-                    'asynchronous driver, preferably out of: %s', driver,
-                    backend_async_drivers)
-            elif driver not in backend_async_drivers:
-                logger.warning(
-                    'Configuration specifies unknown asynchronous driver "%s". '
-                    'Trying to use anyway.', driver)
-                backend_async_drivers = [driver]
-
-        self.__engine = None
-        for driver in backend_async_drivers:
-            scheme = f'{backend}+{driver}'
-            db_url = ':'.join([scheme] + url_parts[1:])
-
-            try:
-                logger.debug('Trying SQLAlchemy backend+driver "%s"', scheme)
-                self.__engine = sqlalchemy.ext.asyncio.create_async_engine(
-                    db_url, **engine_kwargs)
-            except ModuleNotFoundError:
-                continue
-
-            logger.info('Using "%s" SQLAlchemy backend+driver for '
-                        'database accesses', scheme)
-            break
-
-        if self.__engine is None:
-            raise PeekabooDatabaseError(
-                f'None of the drivers for backend "{backend}" could be found: '
-                f'{backend_async_drivers}')
-
-        self.__session_factory = sessionmaker(
-            bind=self.__engine,
-            class_=sqlalchemy.ext.asyncio.AsyncSession)
-
+        # remember for diagnostics
+        self.url = url
+        self.db_prefix = db_prefix
         self.instance_id = instance_id
         self.stale_in_flight_threshold = stale_in_flight_threshold
         self.retries = 5
-        # ultra-simple quadratic backoff:
-        # attempt 1: 10 * 2**(1) == 10-20msecs
-        # attempt 2: 10 * 2**(2) == 20-40msecs
-        # attempt 3: 10 * 2**(3) == 40-80msecs
-        # attempt 4: 10 * 2**(4) == 80-160msecs
-        self.deadlock_backoff_base = 10
-        self.connect_backoff_base = 2000
+        self.connect_backoff_base = 2
+
+        self.analyses_name = f'{db_prefix}-analyses'
+        self.in_flight_name = f'{db_prefix}-in-flight-samples'
+
+        # retry connection errors slowly so we don't flood an already congested
+        # network and because the database might also just be restarting
+        # FIXME: Limit to 'connection refused'
+        self.connect_retrier = tenacity.AsyncRetrying(
+                stop=tenacity.stop_after_attempt(self.retries),
+                wait=tenacity.wait_exponential(
+                    multiplier=self.connect_backoff_base),
+                retry=retry_if_connection_refused,
+                before_sleep=log_retry)
+
+        # retry conflicts immediately (responsibility of the user to use
+        # changed values to avoid conflict)
+        self.conflict_retrier = tenacity.AsyncRetrying(
+                stop=tenacity.stop_after_attempt(self.retries),
+                retry=tenacity.retry_if_exception_type(
+                    aiocouch.ConflictError),
+                before_sleep=log_retry)
+
+        logger.info('Creating CouchDB client for %s/%s',
+                     url, db_prefix)
+        self.client = aiocouch.CouchDB(url, user, password)
+        # FIXME: Only Admins can create databases :(
+        self.analyses_db = aiocouch.Database(self.client, self.analyses_name)
+        self.in_flight_db = aiocouch.Database(self.client, self.in_flight_name)
 
     async def start(self):
-        attempt = 1
-        delay = 0
-        while attempt <= self.retries:
-            async with self.__engine.begin() as conn:
-                try:
-                    await conn.run_sync(Base.metadata.create_all)
-                    break
-                except (OperationalError, DBAPIError,
-                        SQLAlchemyError) as error:
-                    attempt, delay = self.was_transient_error(
-                        error, attempt, 'create metadata')
+        """ Start the database. """
+        #try:
+        #    async for attempt in self.connect_retrier:
+        #        with attempt:
+        #            logger.debug('Validating database credentials')
+        #            await self.client.check_credentials()
 
-                    if attempt < 0:
-                        raise PeekabooDatabaseError(
-                            'Failed to create schema in database: %s' % error)
+                    # FIXME: Only Admins can create databases and indices :(
+                    #logger.debug('Creating analyses database')
+                    #self.analyses_db = await self.client.create(
+                    #    self.analyses_name, exists_ok=True)
+                    #await self.create_index(
+                    #    self.analyses_name, "analysis_time")
+                    #await self.create_index(
+                    #    self.analyses_name, "result_numeric")
 
-            await asyncio.sleep(delay)
+                    #logger.debug('Creating in-flight sample database')
+                    #self.in_flight_db = await self.client.create(
+                    #    self.in_flight_name, exists_ok=True)
+                    # FIXME: Create index here
+        #except aiocouch.UnauthorizedError as error:
+        #    await self.client.close()
+        #    raise PeekabooDatabaseError(
+        #        f'Unauthorized when trying to access database at {self.url}. '
+        #        'Check credentials and permissions.') from error
+        #except tenacity.RetryError as error:
+        #    # retries expired
+        #    await self.client.close()
+        #    raise PeekabooDatabaseError(
+        #        f'Initial connection to database at {self.url} '
+        #        'failed') from error
 
-    def was_transient_error(self, error, attempt, action):
-        """ Decide if an exception signals a transient error condition and
-        sleep for some milliseconds if so.
-
-        @param error: The exception object to look at.
-        @type attempt: The current attempt number.
-        @returns: The new attempt number or -1 if no further attempts should be
-                  made.
-        """
-        # will not be retried anyway, so no use checking and sleeping
-        if attempt >= self.retries:
-            return -1, 0
-
-        # only DBAPIError has connection_invalidated
-
-        if getattr(error, 'connection_invalidated', False):
-            logger.debug('Connection invalidated %s. Retrying.', action)
-            return attempt + 1, 0
-
-        # Access the original DBAPI exception anonymously.
-        # We intentionally do some crude duck-typing here to avoid
-        # imports of otherwise optional RDBMS modules. False-positive
-        # would cause some useless retries of a different but
-        # identically numbered error of another RDBMS.
-        if (getattr(error, 'orig', None) is None or
-                getattr(error.orig, 'args', None) is None):
-            return -1, 0
-
-        args = error.orig.args
-
-        # (MySQLdb._exceptions.OperationalError) (2002, "Can't connect to local
-        # MySQL server through socket '/var/run/mysqld/mysqld.sock' (2)")
-        if (isinstance(args, tuple) and len(args) > 0 and args[0] in [2002, 2003]):
-            # sleep some millisecs
-            maxmsecs = self.connect_backoff_base * 2**attempt
-            backoff = random.randint(maxmsecs/2, maxmsecs)
-            logger.debug('Connection failed %s, backing off for %d '
-                         'milliseconds before retrying', action, backoff)
-            return attempt + 1, backoff / 1000
-
-        # (MySQLdb._exceptions.OperationalError) (1213, 'Deadlock
-        # found when trying to get lock; try restarting transaction')
-        # (sqlite3.OperationalError) database is locked
-        if (isinstance(args, tuple) and len(args) > 0 and
-                args[0] in [1213, 'database is locked']):
-            # sleep some millisecs
-            maxmsecs = self.deadlock_backoff_base * 2**attempt
-            backoff = random.randint(maxmsecs/2, maxmsecs)
-            logger.debug('Database deadlock detected %s, backing off for %d '
-                         'milliseconds before retrying.', action, backoff)
-            return attempt + 1, backoff / 1000
-
-        return -1, 0
+    #async def create_index(self, db, field):
+    #    """ Create an index for a field in the database. """
+    #    return await self.client._server._post(f"/{db}/_index", data={
+    #       "index": {
+    #          "fields": [field],
+    #       },
+    #       "name": f"{field}-json-index",
+    #       "type": "json"})
 
     async def analysis_add(self, sample):
         """
@@ -326,43 +159,49 @@ class PeekabooDatabase:
         @returns: ID of the newly created analysis task (also updated
                   in the sample)
         """
-        sample_info = SampleInfo(
-            state=sample.state,
+        utcnow = datetime.datetime.now(datetime.timezone.utc)
+        sample_info = dict(
+            state=sample.state.name,
             sha256sum=await sample.sha256sum,
             file_extension=sample.file_extension,
-            analysis_time=datetime.now(),
-            result=sample.result,
-            reason=sample.reason)
+            analysis_time=utcnow.isoformat(),
+            result=sample.result.name,
+            # purely for ordering reasons in find queries, particularly worst
+            # result
+            result_numeric=sample.result.value)
 
-        job_id = None
-        attempt = 1
-        delay = 0
-        while attempt <= self.retries:
-            async with self.__session_factory() as session:
-                session.add(sample_info)
-                try:
-                    # flush to retrieve the automatically assigned primary
-                    # key value
-                    await session.flush()
-                    job_id = sample_info.id
-                    await session.commit()
-                    break
-                except (OperationalError, DBAPIError,
-                        SQLAlchemyError) as error:
-                    await session.rollback()
+        try:
+            async for attempt_connect in self.connect_retrier:
+                with attempt_connect:
+                    async for attempt_conflict in self.conflict_retrier:
+                        with attempt_conflict:
+                            # force dashed hex format by explicit string
+                            # conversion
+                            docid = uuid.uuid4()
+                            doc = aiocouch.Document(
+                                self.analyses_db, str(docid), data=sample_info)
+                            await doc.save()
+                            sample.update_id(docid)
+                            return docid
+        except tenacity.RetryError as error:
+            # retries expired
+            raise PeekabooDatabaseError(
+                'Failed to add analysis task to the database: '
+                f'{error}') from error
 
-                    attempt, delay = self.was_transient_error(
-                       error, attempt, 'adding analysis')
-
-                    if attempt < 0:
-                        raise PeekabooDatabaseError(
-                            'Failed to add analysis task to the database: %s' %
-                            error)
-
-            await asyncio.sleep(delay)
-
-        sample.update_id(job_id)
-        return job_id
+    def db_to_internal(self, doc):
+        # TODO: more schema validation
+        return dict(
+            id=doc['_id'],
+            state=JobState[doc['state']],
+            sha256sum=doc['sha256sum'],
+            file_extension=doc['file_extension'],
+            analysis_time=datetime.datetime.fromisoformat(
+                doc['analysis_time']),
+            result=Result[doc['result']],
+            reason=doc.get('reason'),
+            report=doc.get('report'),
+            cuckoo_report=doc.get('cuckoo_report'))
 
     async def analysis_update(self, sample):
         """
@@ -370,118 +209,160 @@ class PeekabooDatabase:
 
         @param sample: The sample object for this analysis task.
         """
-        statement = sqlalchemy.sql.expression.update(SampleInfo).where(
-            SampleInfo.id == sample.id).values(
-                state=sample.state,
-                result=sample.result,
-                reason=sample.reason)
+        try:
+            async for attempt_connect in self.connect_retrier:
+                with attempt_connect:
+                    analysis = await self.analyses_db[str(sample.id)]
+                    analysis.update(dict(
+                        state=sample.state.name,
+                        #sha256sum=await sample.sha256sum,
+                        #file_extension=sample.file_extension,
+                        #analysis_time=utcnow.isoformat(),
+                        result=sample.result.name,
+                        # purely for ordering reasons in find queries, particularly worst
+                        # result
+                        result_numeric=sample.result.value,
+                        reason=sample.reason,
+                        report=sample.peekaboo_report))
 
-        attempt = 1
-        delay = 0
-        while attempt <= self.retries:
-            async with self.__session_factory() as session:
-                try:
-                    await session.execute(statement)
-                    await session.commit()
-                    break
-                except (OperationalError, DBAPIError,
-                        SQLAlchemyError) as error:
-                    await session.rollback()
+                    if sample.cuckoo_report is not None:
+                        analysis['cuckoo'] = sample.cuckoo_report.dump
+                    #if sample.cortex_report is not None:
+                    #    analysis['cortex'] = sample.cortex_report
+                    #if sample.filetools_report is not None:
+                    #    analysis['filetools'] = sample.filetools_report
+                    #if sample.oletools_report is not None:
+                    #    analysis['oletools'] = sample.oletools_report
+                    #if sample.knowntools_report is not None:
+                    #    analysis['knowntools'] = sample.knowntools_report
+                    await analysis.save()
 
-                    attempt, delay = self.was_transient_error(
-                        error, attempt, 'updating analysis')
+                    # attach the sample in case it is malware
+                    if sample.result == Result.bad:
+                        attachment = analysis.attachment("sample")
+                        # do not use client-supplied content type here to avoid
+                        # attampts of confusing CouchDB. Instead we simply save
+                        # some bytes here and metadata such as the content type
+                        # claimed by the client is part of the report.
+                        await attachment.save(
+                            sample.content, "application/octet-stream")
+        except tenacity.RetryError as error:
+            raise PeekabooDatabaseError(
+                f'{sample.id}: Failed to update analysis task in the '
+                f'database: {error}') from error
 
-                    if attempt < 0:
-                        raise PeekabooDatabaseError(
-                            'Failed to update analysis task in the database: %s' %
-                            error)
+    async def analysis_journal_query(self, sample, query_update={}):
+        """ Find entries in the analysis journal based on a base query
+        referencing properties of a supplied sample that can be updated with
+        additional criteria.
 
-            await asyncio.sleep(delay)
+        @param query_update: dict with additional parameters to be merged into
+                             the base query.
 
-    async def analysis_journal_fetch_journal(self, sample):
+        @return: A dict containing the attributes of the requested sample as
+                 stored in the journal and converted from database
+                 representation back into our internal schema (i.e. Enums and
+                 datetime objects).
         """
-        Fetch information stored in the database about a given sample object.
+        query = dict(
+            selector=dict(
+                _id={'$ne': str(sample.id)},
+                result={'$ne': Result.failed.name},
+                state=JobState.FINISHED.name,
+                sha256sum=await sample.sha256sum,
+                file_extension=sample.file_extension))
+        query.update(query_update)
+
+        try:
+            async for attempt_connect in self.connect_retrier:
+                with attempt_connect:
+                    # because we want to provide selector and sort criteria
+                    # from dict we need to supply it as kwargs
+                    async for doc in self.analyses_db.find(**query):
+                        return self.db_to_internal(doc)
+        except tenacity.RetryError as error:
+            raise PeekabooDatabaseError(
+                'Failed to fetch analysis journal from the database: '
+                f'{error}') from error
+
+        # reached if no documents are found
+        return None
+
+    async def analysis_journal_get_first(self, sample):
+        """
+        Fetch the first analysis result stored in the database about a given
+        sample object.
 
         @param sample: The sample object of which the information shall be
                        fetched from the database.
-        @return: A sorted list of (analysis_time, result, reason) of the
+        @return: A dict containing the attributes of the requested sample as
+                 stored in the journal.
+        """
+        return await self.analysis_journal_query(sample, dict(
+            sort=[dict(analysis_time='asc')]))
+
+    async def analysis_journal_get_last(self, sample):
+        """
+        Fetch the worst analysis result stored in the database about a given
+        sample object.
+
+        @param sample: The sample object of which the information shall be
+                       fetched from the database.
+        @return: A dict containing id, result, reason and report of the
                  requested sample.
         """
-        statement = sqlalchemy.sql.expression.select(
-            SampleInfo.analysis_time, SampleInfo.result,
-            SampleInfo.reason).where(
-                SampleInfo.id != sample.id).where(
-                    SampleInfo.result != Result.failed).filter_by(
-                        state=JobState.FINISHED,
-                        sha256sum=await sample.sha256sum,
-                        file_extension=sample.file_extension).order_by(
-                            SampleInfo.analysis_time)
+        return await self.analysis_journal_query(sample, dict(
+            sort=[dict(analysis_time='desc')]))
 
-        sample_journal = None
-        attempt = 1
-        delay = 0
-        while attempt <= self.retries:
-            async with self.__session_factory() as session:
-                try:
-                    proxy = await session.execute(statement)
-                    sample_journal = proxy.all()
-                    break
-                except (OperationalError, DBAPIError,
-                        SQLAlchemyError) as error:
-                    await session.rollback()
+    async def analysis_journal_get_worst(self, sample):
+        """
+        Fetch the worst analysis result stored in the database about a given
+        sample object.
 
-                    attempt, delay = self.was_transient_error(
-                        error, attempt, 'fetching analysis journal')
-
-                    if attempt < 0:
-                        raise PeekabooDatabaseError(
-                            'Failed to fetch analysis journal from the database: %s' %
-                            error)
-
-            await asyncio.sleep(delay)
-
-        return sample_journal
+        @param sample: The sample object of which the information shall be
+                       fetched from the database.
+        @return: A dict containing id, result, reason and report of the
+                 requested sample.
+        """
+        return await self.analysis_journal_query(sample, dict(
+            sort=[dict(result_numeric='desc')]))
 
     async def analysis_retrieve(self, job_id):
         """
         Fetch information stored in the database about a given sample object.
 
         @param job_id: ID of the analysis to retrieve
-        @type job_id: int
+        @type job_id: uuid.UUID
         @return: reason and result for the given analysis task
         """
-        statement = sqlalchemy.sql.expression.select(
-            SampleInfo.reason, SampleInfo.result).filter_by(
-                id=job_id, state=JobState.FINISHED)
+        query = dict(
+            _id=str(job_id), state=JobState.FINISHED.name)
 
-        result = None
-        attempt = 1
-        delay = 0
-        while attempt <= self.retries:
-            async with self.__session_factory() as session:
-                try:
-                    proxy = await session.execute(statement)
-                    result = proxy.first()
-                    break
-                except (OperationalError, DBAPIError,
-                        SQLAlchemyError) as error:
-                    await session.rollback()
+        try:
+            async for attempt_connect in self.connect_retrier:
+                with attempt_connect:
+                    async for doc in self.analyses_db.find(query):
+                        return self.db_to_internal(doc)
+        except tenacity.RetryError as error:
+            raise PeekabooDatabaseError(
+                f'{sample.id}: Failed to retrieve analysis from the '
+                f'database: {error}') from error
 
-                    attempt, delay = self.was_transient_error(
-                        error, attempt, 'retrieving analysis result')
-
-                    if attempt < 0:
-                        raise PeekabooDatabaseError(
-                            'Failed to retrieve analysis from the database: %s' %
-                            error)
-
-            await asyncio.sleep(delay)
-
-        return result
+        # reached if analysis matching criterion is not found
+        return None
 
     async def mark_sample_in_flight(self, sample, instance_id=None, start_time=None):
         """
         Mark a sample as in flight, i.e. being worked on by an instance.
+
+        This is meant as a best-effort lock to improve efficiency by avoiding
+        duplicated analyses for the same sample. Race conditions are likely and
+        will in our case only lead to duplicated analyses.
+
+        Using only the sha256sum as in-flight marker is an oversimplification
+        that will actually hurt throughput if the same file content is
+        presented multiple times with different accompanying meta-data such as
+        file extension or content type that necessitate individual analyses.
 
         @param sample: The sample to mark as in flight.
         @param instance_id: (optionally) The ID of the instance that is
@@ -499,44 +380,31 @@ class PeekabooDatabase:
             instance_id = self.instance_id
 
         if start_time is None:
-            start_time = datetime.utcnow()
+            start_time = datetime.datetime.now(datetime.timezone.utc)
 
-        in_flight_marker = InFlightSample(sha256sum=await sample.sha256sum,
-                                          instance_id=instance_id,
-                                          start_time=start_time)
-        attempt = 1
-        delay = 0
-        while attempt <= self.retries:
-            # a new session needs to be constructed on each attempt
-            async with self.__session_factory() as session:
-                # try to mark this sample as in flight in an atomic insert
-                # operation (modulo possible deadlocks with various RDBMS)
-                session.add(in_flight_marker)
+        in_flight_marker_id = await sample.sha256sum
+        in_flight_marker = dict(
+            instance_id=instance_id,
+            start_time=start_time.isoformat())
 
-                try:
-                    await session.commit()
-                    logger.debug('%d: Marked sample in flight', sample.id)
-                    return True
-                # duplicate primary key == entry already exists
-                except IntegrityError:
-                    await session.rollback()
-                    logger.debug('%d: Sample is already in flight on another '
-                                 'instance', sample.id)
-                    return False
-                except (OperationalError, DBAPIError,
-                        SQLAlchemyError) as error:
-                    await session.rollback()
-
-                    attempt, delay = self.was_transient_error(
-                        error, attempt, 'marking sample %d in flight' %
-                        sample.id)
-
-                    if attempt < 0:
-                        raise PeekabooDatabaseError(
-                            '%d: Unable to mark sample as in flight: %s' % (
-                                sample.id, error))
-
-            await asyncio.sleep(delay)
+        try:
+            async for attempt_connect in self.connect_retrier:
+                with attempt_connect:
+                    try:
+                        marker = aiocouch.Document(
+                            self.in_flight_db, in_flight_marker_id,
+                            data=in_flight_marker)
+                        await marker.save()
+                        logger.debug('%s: Marked sample in flight', sample.id)
+                        return True
+                    except ConflictError:
+                        logger.debug('%s: Sample is already in flight on another '
+                                    'instance', sample.id)
+                        return False
+        except tenacity.RetryError as error:
+            raise PeekabooDatabaseError(
+                f'{sample.id}: Unable to mark sample as in flight: '
+                f'{error}') from error
 
         return False
 
@@ -557,45 +425,40 @@ class PeekabooDatabase:
         if instance_id is None:
             instance_id = self.instance_id
 
-        statement = sqlalchemy.sql.expression.delete(
-            InFlightSample).where(
-                InFlightSample.sha256sum == await sample.sha256sum).where(
-                    InFlightSample.instance_id == instance_id)
-
-        attempt = 1
+        in_flight_marker_id = await sample.sha256sum
         cleared = 0
-        while attempt <= self.retries:
-            async with self.__session_factory() as session:
-                try:
-                    # clear in-flight marker from database
-                    marker = await session.execute(statement)
-                    await session.commit()
-                    cleared = marker.rowcount
-                    break
-                except (OperationalError, DBAPIError,
-                        SQLAlchemyError) as error:
-                    await session.rollback()
+        try:
+            async for attempt_connect in self.connect_retrier:
+                with attempt_connect:
+                    try:
+                        marker = await self.in_flight_db[in_flight_marker_id]
 
-                    attempt, delay = self.was_transient_error(
-                        error, attempt, 'clearing in-flight status of '
-                        'sample %d' % sample.id)
+                        marker_instance_id = marker['instance_id']
+                        if marker_instance_id != instance_id:
+                            raise PeekabooDatabaseError(
+                                f'{sample.id} Unexpected inconsistency: '
+                                f'Instance {marker_instance_id} '
+                                'has meanwhile started processing our '
+                                'in-flight sample.') from error
 
-                    if attempt < 0:
+                        # race condition with another instance having deleted
+                        # and re-created our marker - couchdb cannot delete by
+                        # criteria
+
+                        # deletion only starts a new document revision -
+                        # accumulation?
+                        await marker.delete()
+                        logger.debug(
+                            '%s: Removed sample in-flight marker', sample.id)
+                    except aiocouch.NotFoundError:
                         raise PeekabooDatabaseError(
-                            '%d: Unable to clear in-flight status of sample: '
-                            '%s' % (sample.id, error))
-
-            await asyncio.sleep(delay)
-
-        if cleared == 0:
+                            f'{sample.id}: Unexpected inconsistency: Sample '
+                            'not recorded as in-flight upon clearing '
+                            'flag.') from error
+        except tenacity.RetryError as error:
             raise PeekabooDatabaseError(
-                '%d: Unexpected inconsistency: Sample not recorded as '
-                'in-flight upon clearing flag.' % sample.id)
-        elif cleared > 1:
-            raise PeekabooDatabaseError(
-                '%d: Unexpected inconsistency: Multiple instances of sample '
-                'in-flight status cleared against database constraints!?' %
-                sample.id)
+                f'{sample.id}: Unable to clear in-flight status of sample: '
+                f'{error}') from error
 
     async def clear_in_flight_samples(self, instance_id=None):
         """
@@ -620,37 +483,29 @@ class PeekabooDatabase:
 
         if instance_id < 0:
             # delete all locks
-            statement = sqlalchemy.sql.expression.delete(InFlightSample)
+            query = dict()
             logger.debug('Clearing database of all in-flight samples.')
         else:
             # delete only the locks of a specific instance
-            statement = sqlalchemy.sql.expression.delete(
-                InFlightSample).where(
-                    InFlightSample.instance_id == instance_id)
+            query = dict(instance_id=instance_id)
             logger.debug('Clearing database of all in-flight samples of '
                          'instance %d.', instance_id)
 
-        attempt = 1
-        while attempt <= self.retries:
-            async with self.__session_factory() as session:
-                try:
-                    await session.execute(statement)
-                    await session.commit()
-                    break
-                except (OperationalError, DBAPIError,
-                        SQLAlchemyError) as error:
-                    await session.rollback()
-
-                    attempt, delay = self.was_transient_error(
-                        error, attempt,
-                        'clearing database of in-flight samples')
-
-                    if attempt < 0:
-                        raise PeekabooDatabaseError(
-                            'Unable to clear the database of in-flight '
-                            'samples: %s' % error)
-
-            await asyncio.sleep(delay)
+        try:
+            async for attempt_connect in self.connect_retrier:
+                with attempt_connect:
+                    # race condition with other instances creating more markers
+                    async for marker in self.in_flight_db.find(query):
+                        try:
+                            await marker.delete()
+                        except aiocouch.NotFoundError:
+                            # race condition with another instance having
+                            # deleted its marker on its own
+                            pass
+        except tenacity.RetryError as error:
+            raise PeekabooDatabaseError(
+                'Unable to clear the database of in-flight samples: '
+                f'{error}') from error
 
     async def clear_stale_in_flight_samples(self):
         """
@@ -666,53 +521,33 @@ class PeekabooDatabase:
             'Clearing database of all stale in-flight samples '
             '(%d seconds)', self.stale_in_flight_threshold)
 
-        def clear_statement(statement_class):
-            # delete only the locks of a specific instance
-            return statement_class(InFlightSample).where(
-                InFlightSample.start_time <= datetime.utcnow() - timedelta(
-                    seconds=self.stale_in_flight_threshold))
+        # delete only the locks of a specific instance
+        utcnow = datetime.datetime.now(datetime.timezone.utc)
+        threshold = datetime.timedelta(seconds=self.stale_in_flight_threshold)
+        query = dict(start_time={'$lte': (utcnow - threshold).isoformat()})
 
-        delete_statement = clear_statement(sqlalchemy.sql.expression.delete)
-        select_statement = clear_statement(sqlalchemy.sql.expression.select)
+        try:
+            async for attempt_connect in self.connect_retrier:
+                with attempt_connect:
+                    # race condition with other instances creating more markers
+                    async for stale in self.in_flight_db.find(query):
+                        logger.debug(
+                            'Stale in-flight marker to clear: %s', stale)
+                        try:
+                            await stale.delete()
+                        except aiocouch.NotFoundError:
+                            # race condition with another instance having
+                            # deleted its marker on its own
+                            pass
 
-        attempt = 1
-        cleared = 0
-        while attempt <= self.retries:
-            async with self.__session_factory() as session:
-                try:
-                    # only do the query if debugging is enabled
-                    if logger.isEnabledFor(logging.DEBUG):
-                        # obviously there's a race between logging and actual
-                        # delete here, use with caution, compare with actual
-                        # number of markers cleared below before relying on it
-                        # for debugging
-                        markers = await session.execute(select_statement)
-                        for stale in markers:
-                            logger.debug(
-                                'Stale in-flight marker to clear: %s', stale)
+        except tenacity.RetryError as error:
+            raise PeekabooDatabaseError(
+                'Unable to clear the database of stale in-flight samples: '
+                f'{error}') from error
 
-                    markers = await session.execute(delete_statement)
-                    await session.commit()
+    def shut_down(self):
+        """ Trigger shutdown of database components. """
 
-                    cleared = markers.rowcount
-                    if cleared > 0:
-                        logger.warning(
-                            '%d stale in-flight samples cleared.', cleared)
-
-                    break
-                except (OperationalError, DBAPIError,
-                        SQLAlchemyError) as error:
-                    await session.rollback()
-
-                    attempt, delay = self.was_transient_error(
-                        error, attempt,
-                        'clearing the database of stale in-flight samples')
-
-                    if attempt < 0:
-                        raise PeekabooDatabaseError(
-                            'Unable to clear the database of stale in-flight '
-                            'samples: %s' % error)
-
-            await asyncio.sleep(delay)
-
-        return cleared > 0
+    async def close_down(self):
+        """ Finally close down all resources and wait for it to finish. """
+        await self.client.close()

@@ -89,7 +89,7 @@ sub ask_peekaboo {
   }
 
   my $scan_url = "${base_url}/v1/scan";
-  my $report_url_tmpl = "${base_url}/v1/report/%d";
+  my $report_url_tmpl = "${base_url}/v1/report/%s";
 
   # extract some additional info for peekaboo from the parts objects and
   # prepare and run http reuqests to the peekaboo server
@@ -226,7 +226,7 @@ sub ask_peekaboo {
             $answer->decoded_content);
     my $job = $peekaboo_response->{"job_id"};
 
-    my $message = sprintf("Peekaboo: %s submitted as job %d", $partname, $job);
+    my $message = sprintf("Peekaboo: %s submitted as job %s", $partname, $job);
     Amavis::Util::do_log(5, "Peekaboo: " . $message);
     $result_text .= $message . "\n";
 
@@ -255,7 +255,7 @@ sub ask_peekaboo {
 
       my $code = $answer->code;
       if ($code == 200) {
-        my $message = sprintf("Peekaboo: Received report for job %d", $job);
+        my $message = sprintf("Peekaboo: Received report for job %s", $job);
         Amavis::Util::do_log(5, $message);
         $result_text .= $message . "\n";
 
@@ -275,12 +275,12 @@ sub ask_peekaboo {
         if ($result eq "failed") {
           # no sense in dragging this out since one failed analysis means we
           # cannot reach any conclusive verdict
-          my $message = sprintf("Peekaboo: Job %d failed", $job);
+          my $message = sprintf("Peekaboo: Job %s failed", $job);
           Amavis::Util::do_log(1, $message);
           return (undef, $result_text . $message . "\n", undef)
         } elsif ($result eq "bad") {
           # same applies for one bad sample: we found malware, done
-          my $message = sprintf("Peekaboo: Job %d found malware", $job);
+          my $message = sprintf("Peekaboo: Job %s found malware", $job);
           Amavis::Util::do_log(5, $message);
           return (1, $result_text . $message . "\n", undef)
         }
@@ -288,13 +288,13 @@ sub ask_peekaboo {
         # everything else means that this job did not find malware nor fail
       } elsif ($code == 404) {
         # result not yet present
-        Amavis::Util::do_log(5, "Peekaboo: Job %d not finished yet", $job);
+        Amavis::Util::do_log(5, "Peekaboo: Job %s not finished yet", $job);
         push(@jobs_left, $job);
         next;
       } else {
         # all other codes indicate some kind of error
         my $message = sprintf("Peekaboo: Received error %d when " .
-                "requesting report for job %d", $code, $job);
+                "requesting report for job %s", $code, $job);
         Amavis::Util::do_log(1, $message);
         return (undef, $result_text . $message . "\n", undef);
       }

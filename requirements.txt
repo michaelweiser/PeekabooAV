@@ -1,6 +1,5 @@
 aiocouch
 aiohttp
-sqlalchemy[asyncio]>=1.4.24
 tenacity
 python-magic>=0.4.17
 oletools>=0.54

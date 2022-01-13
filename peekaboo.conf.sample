@@ -48,21 +48,8 @@
 # Database configuration
 #
 [db]
-# SQLite
-#url              :    sqlite:////var/lib/peekaboo/peekaboo.db
-# MySQL (recommended)
-# url             :    mysql://user:password@host/database
-# PostgreSQL
-# url             :    postgresql://user:password@host:port/database
-
-# Enable additional logging by the SQLAlchemy database module beyond Peekaboo's
-# own logging. Can be considered another set of debug logging even beyond
-# Peekaboo's DEBUG log level.
-#log_level        :    WARNING
-
-[processing_info]
 #url: http://127.0.0.1:5984
-#db: peekaboo
+#prefix: peekaboo
 #user: peekaboo
 #password: P@ssw0rd
 

@@ -40,7 +40,6 @@ from argparse import ArgumentParser
 
 import aiocouch
 from sdnotify import SystemdNotifier
-from sqlalchemy.exc import SQLAlchemyError
 
 from peekaboo import PEEKABOO_OWL, __version__
 from peekaboo.config import (
@@ -284,16 +283,12 @@ async def async_main():
     # establish a connection to the database
     try:
         db_con = PeekabooDatabase(
-            db_url=config.db_url, instance_id=config.cluster_instance_id,
-            stale_in_flight_threshold=config.cluster_stale_in_flight_threshold,
-            log_level=config.db_log_level)
+            config.db_url, config.db_prefix, config.db_user, config.db_password,
+            instance_id=config.cluster_instance_id,
+            stale_in_flight_threshold=config.cluster_stale_in_flight_threshold)
         await db_con.start()
     except PeekabooDatabaseError as error:
         logging.critical(error)
-        sys.exit(1)
-    except SQLAlchemyError as dberr:
-        logger.critical('Failed to establish a connection to the database '
-                        'at %s: %s', config.db_url, dberr)
         sys.exit(1)
 
     # initialize the daemon infrastructure such as PID file and dropping
@@ -331,25 +326,6 @@ async def async_main():
     threadpool = concurrent.futures.ThreadPoolExecutor(
         config.worker_count, 'ThreadPool-')
 
-    pi_client = None
-    pi_db = None
-    if config.pi_url and config.pi_db:
-        logger.debug("Creating CouchDB client for %s/%s",
-                     config.pi_url, config.pi_db)
-        pi_client = aiocouch.CouchDB(
-            config.pi_url, config.pi_user, config.pi_password)
-        try:
-            await pi_client.check_credentials()
-        except aiocouch.UnauthorizedError:
-            logger.error(
-                "Unauthorized when trying to access processing info "
-                "database at %s. Check credentials and permissions.",
-                config.pi_url)
-            await pi_client.close()
-            sys.exit(1)
-
-        pi_db = await pi_client.create(config.pi_db, exists_ok=True)
-
     # collect a list of awaitables from started subsystems from which to gather
     # unexpected error conditions such as exceptions
     awaitables = []
@@ -362,13 +338,13 @@ async def async_main():
             worker_count=config.worker_count, ruleset_config=ruleset_config,
             db_con=db_con, analyzer_config=analyzer_config,
             cluster_duplicate_check_interval=cldup_check_interval,
-            threadpool=threadpool, pi_db=pi_db)
+            threadpool=threadpool)
         sig_handler.register_listener(job_queue)
         awaitables.extend(await job_queue.start())
     except PeekabooConfigException as error:
         logging.critical(error)
-        if pi_client is not None:
-            await pi_client.close()
+        db_con.shut_down()
+        await db_con.close_down()
         sys.exit(1)
 
     try:
@@ -384,13 +360,17 @@ async def async_main():
     except Exception as error:
         logger.critical('Failed to start Peekaboo Server: %s', error)
         job_queue.shut_down()
+        db_con.shut_down()
         await job_queue.close_down()
-        if pi_client is not None:
-            await pi_client.close()
+        await db_con.close_down()
         sys.exit(1)
 
     # abort startup if shutdown was requested meanwhile
     if sig_handler.shutdown_requested:
+        job_queue.shut_down()
+        db_con.shut_down()
+        await job_queue.close_down()
+        await db_con.close_down()
         sys.exit(0)
 
     SystemdNotifier().notify("READY=1")
@@ -414,8 +394,8 @@ async def async_main():
     await server.close_down()
     await job_queue.close_down()
 
-    if pi_client is not None:
-        await pi_client.close()
+    # shut down the database last so we can be reasonably sure that no other
+    # component is still updating it
 
     # do a final cleanup pass through the database
     try:
@@ -423,6 +403,9 @@ async def async_main():
         await db_con.clear_stale_in_flight_samples()
     except PeekabooDatabaseError as dberr:
         logger.error(dberr)
+
+    db_con.shut_down()
+    await db_con.close_down()
 
     sys.exit(0)
 

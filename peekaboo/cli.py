@@ -135,8 +135,7 @@ class PeekabooUtil:
                     'message', 'No explanation given by Peekaboo'))
                 continue
 
-            logger.debug('File %s submitted as job %d', filename, job_id)
-
+            logger.debug('File %s submitted as job %s', filename, job_id)
             jobs.append(job_id)
 
         exit_code = 0
@@ -156,6 +155,10 @@ class PeekabooUtil:
                     exit_code = 1
 
                 logger.info("%d: %s", job, json_resp['reason'])
+                report = json_resp.get('report')
+                if report is not None:
+                    for line in report:
+                        logger.info(line)
 
             if not jobs_left:
                 break

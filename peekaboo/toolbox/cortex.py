@@ -611,7 +611,7 @@ class Cortex:
         if (job_id in self.running_jobs and
                 self.running_jobs[job_id] is not job):
             logger.warning(
-                '%d: A job with ID %s already registered as running '
+                '%s: A job with ID %s already registered as running '
                 'for different sample %d will be marked failed',
                 job.sample.id, job_id,
                 self.running_jobs[job_id].sample.id)
@@ -657,6 +657,7 @@ class Cortex:
             logger.debug('No job found for job ID %s', job_id)
             return None
 
+        logger.debug('%s: Requesting Cortex report', job.sample.id)
         try:
             # register this job's analysis report with our main report object
             job.sample.cortex_report.register_report(job.analyzer, report)

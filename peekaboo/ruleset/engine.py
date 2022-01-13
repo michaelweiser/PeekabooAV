@@ -200,7 +200,7 @@ class RulesetEngine:
         @returns: Nothing, all state is recorded in the sample """
         for rule in self.rules:
             rule_name = rule.rule_name
-            logger.debug("%d: Processing rule '%s'", sample.id, rule_name)
+            logger.debug("%s: Processing rule '%s'", sample.id, rule_name)
 
             try:
                 result = await rule.evaluate(sample)
@@ -211,7 +211,7 @@ class RulesetEngine:
             # catch all other exceptions for this rule
             except Exception as error:
                 logger.warning(
-                    "%d: Unexpected error in '%s'", sample.id, rule_name)
+                    "%s: Unexpected error in '%s'", sample.id, rule_name)
                 logger.exception(error)
                 # create "fake" RuleResult
                 result = RuleResult("RulesetEngine", result=Result.failed,
@@ -219,11 +219,11 @@ class RulesetEngine:
                                     further_analysis=False)
                 sample.add_rule_result(result)
 
-            logger.info("%d: Rule '%s' processed", sample.id, rule_name)
+            logger.info("%s: Rule '%s' processed", sample.id, rule_name)
             if not result.further_analysis:
                 return
 
-        logger.info("%d: Rules evaluated", sample.id)
+        logger.info('%s: Rules evaluated', sample.id)
 
     def shut_down_resources(self):
         """ Shut down dynamically allocated resources such as job trackers.

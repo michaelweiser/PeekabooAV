@@ -150,10 +150,10 @@ class Sample:
         this to the report and updates the overall analysis result (so far).
         """
         res_str = "%s" % res
-        logger.debug("%d: Adding rule result %s", self.__id, res_str)
+        logger.debug('%s: Adding rule result %s', self.__id, res_str)
         self.__report.append(res_str)
 
-        logger.debug("%d: Current overall result: %s, new rule result: %s",
+        logger.debug('%s: Current overall result: %s, new rule result: %s',
                      self.__id, self.__result, res.result)
         # check if result of this rule is worse than what we know so far
         if res.result >= self.__result:

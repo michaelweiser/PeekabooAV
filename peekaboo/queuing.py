@@ -43,7 +43,7 @@ class JobQueue:
     """ Peekaboo's queuing system. """
     def __init__(self, ruleset_config, db_con, analyzer_config,
                  worker_count=4, cluster_duplicate_check_interval=5,
-                 threadpool=None, pi_db=None):
+                 threadpool=None):
         """ Initialise job queue by creating n Peekaboo workers to process
         samples.
 
@@ -65,10 +65,6 @@ class JobQueue:
         self.workers = []
         self.worker_count = worker_count
         self.threadpool = threadpool
-        self.pi_db = pi_db
-        if not self.pi_db:
-            logger.debug('Disabling dumping processing info because no '
-                         'database is configured')
 
         # keep a backlog of samples with hashes identical to samples currently
         # in analysis to avoid analysing multiple identical samples
@@ -91,7 +87,7 @@ class JobQueue:
         # state.
         for wno in range(0, self.worker_count):
             logger.debug("Create Worker %d", wno)
-            worker = Worker(wno, self, self.ruleset_engine, db_con, pi_db)
+            worker = Worker(wno, self, self.ruleset_engine, db_con)
             self.workers.append(worker)
 
         logger.info('Created %d Workers.', self.worker_count)
@@ -192,16 +188,16 @@ class JobQueue:
 
         if duplicate is not None:
             logger.debug(
-                "%d: Sample is duplicate and waiting for running analysis "
-                "to finish", duplicate)
+                '%s: Sample is duplicate and waiting for running analysis '
+                'to finish', duplicate)
         elif cluster_duplicate is not None:
             logger.debug(
-                "%d: Sample is concurrently processed by another instance "
-                "and held", cluster_duplicate)
+                '%s: Sample is concurrently processed by another instance '
+                'and held', cluster_duplicate)
         elif resubmit is not None:
-            logger.debug("%d: Resubmitted sample to job queue", resubmit)
+            logger.debug('%s: Resubmitted sample to job queue', resubmit)
         else:
-            logger.debug("%d: New sample submitted to job queue", sample.id)
+            logger.debug('%s: New sample submitted to job queue', sample.id)
 
         return True
 
@@ -248,7 +244,7 @@ class JobQueue:
                         'master': sample,
                         'duplicates': sample_duplicates,
                     }
-                    submitted_cluster_duplicates.append(sample.id)
+                    submitted_cluster_duplicates.append(str(sample.id))
                     await self.jobs.put(sample)
                     del self.cluster_duplicates[sample_hash]
 
@@ -290,7 +286,7 @@ class JobQueue:
 
             # submit all samples which have accumulated in the backlog
             for sample in self.duplicates[sample_hash]['duplicates']:
-                submitted_duplicates.append(sample.id)
+                submitted_duplicates.append(str(sample.id))
                 await self.jobs.put(sample)
 
             sample = self.duplicates[sample_hash]['master']
@@ -301,7 +297,7 @@ class JobQueue:
 
             del self.duplicates[sample_hash]
 
-        logger.debug("%d: Cleared sample from in-flight list", sample.id)
+        logger.debug('%s: Cleared sample from in-flight list', sample.id)
         if len(submitted_duplicates) > 0:
             logger.debug(
                 "Submitted duplicates from backlog: %s", submitted_duplicates)
@@ -397,7 +393,7 @@ class ClusterDuplicateHandler:
 
 class Worker:
     """ A Worker to process a sample. """
-    def __init__(self, wid, job_queue, ruleset_engine, db_con, pi_db):
+    def __init__(self, wid, job_queue, ruleset_engine, db_con):
         # whether we should run
         self.task = None
         self.worker_id = wid
@@ -405,7 +401,6 @@ class Worker:
         self.job_queue = job_queue
         self.ruleset_engine = ruleset_engine
         self.db_con = db_con
-        self.pi_db = pi_db
 
     async def start(self):
         self.task = asyncio.ensure_future(self.run())
@@ -419,7 +414,7 @@ class Worker:
             # wait blocking for next job
             sample = await self.job_queue.dequeue()
 
-            logger.info('%d: Worker %d: Processing sample',
+            logger.info('%s: Worker %d: Processing sample',
                         sample.id, self.worker_id)
 
             # The following used to be one big try/except block catching any
@@ -433,19 +428,16 @@ class Worker:
             try:
                 await self.ruleset_engine.run(sample)
             except PeekabooAnalysisDeferred:
-                logger.debug('%d: Report still pending', sample.id)
+                logger.debug('%s: Report still pending', sample.id)
                 continue
-
-            if sample.result >= Result.failed:
-                await self.dump_processing_info(sample)
 
             sample.mark_done()
 
-            logger.debug('%d: Saving results to database', sample.id)
+            logger.debug('%s: Saving results to database', sample.id)
             try:
                 await self.db_con.analysis_update(sample)
             except PeekabooDatabaseError as dberr:
-                logger.error('%d: Failed to save analysis result to '
+                logger.error('%s: Failed to save analysis result to '
                              'database: %s', sample.id, dberr)
                 # no showstopper, we can limp on without caching in DB
 
@@ -453,49 +445,7 @@ class Worker:
 
     async def dump_processing_info(self, sample):
         """ Save processing info to an external data store for reference. """
-        if self.pi_db is None:
-            return
-
-        logger.debug('%d: Dumping processing info', sample.id)
-
-        # Peekaboo's report
-        processing_info = {
-            'report': sample.peekaboo_report,
-        }
-
-        if sample.cuckoo_report:
-            processing_info['cuckoo'] = sample.cuckoo_report.dump
-        #if sample.cortex_report:
-        #    processing_info['cortex'] = sample.cortex_report
-        #if sample.filetools_report:
-        #    processing_info['filetools'] = sample.filetools_report
-        #if sample.oletools_report:
-        #    processing_info['oletools'] = sample.oletools_report
-        #if sample.knowntools_report:
-        #    processing_info['knowntools'] = sample.knowntools_report
-
-        try:
-            doc = await self.pi_db.create(f"{sample.id}", data=processing_info)
-        except aiocouch.ConflictError:
-            logger.warning("%d: Failed to dump processing info because "
-                           "document already exists", sample.id)
-            return
-
-        try:
-            await doc.save()
-        except ConflictError as conflict:
-            logger.warning("%d: Saving of processing info failed with "
-                           "unexpected conflict: %s", sample.id, conflict)
-            return
-
-        # attach the sample in case it is malware
-        if sample.result == Result.bad:
-            attachment = doc.attachment("sample")
-            # do not use client-supplied content type here to avoid attampts of
-            # confusing CouchDB. Instead we simply save some bytes here and
-            # metadata such as the content type claimed by the client is part
-            # of the report.
-            await attachment.save(sample.content, "application/octet-stream")
+        logger.debug('%s: Dumping processing info', sample.id)
 
     def shut_down(self):
         """ Asynchronously initiate worker shutdown. """

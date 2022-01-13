@@ -157,14 +157,14 @@ class Rule:
         if report is not None:
             return report
 
-        logger.debug("%d: Submitting to Cuckoo", sample.id)
+        logger.debug('%s: Submitting to Cuckoo', sample.id)
         try:
             job_id = await self.cuckoo.submit(sample)
         except CuckooSubmitFailedException as failed:
-            logger.error("%d: Submit to Cuckoo failed: %s", sample.id, failed)
+            logger.error('%s: Submit to Cuckoo failed: %s', sample.id, failed)
             return None
 
-        logger.info("%d: Sample submitted to Cuckoo. Job ID: %s",
+        logger.info('%s: Sample submitted to Cuckoo. Job ID: %s',
                     sample.id, job_id)
         raise PeekabooAnalysisDeferred()
 
@@ -227,14 +227,14 @@ class Rule:
                                           ruleset run until result has been
                                           retrieved.
         """
-        logger.debug("%d: Submitting to Cortex", sample.id)
+        logger.debug('%s: Submitting to Cortex', sample.id)
         try:
             job_id = await self.cortex.submit(sample, analyzer)
         except CortexSubmitFailedException as failed:
-            logger.error("%d: Submit to Cortex failed: %s", sample.id, failed)
+            logger.error('%s: Submit to Cortex failed: %s', sample.id, failed)
             return None
 
-        logger.info("%d: Sample submitted to Cortex. Job ID: %s",
+        logger.info('%s: Sample submitted to Cortex. Job ID: %s',
                     sample.id, job_id)
         raise PeekabooAnalysisDeferred()
 
@@ -248,10 +248,9 @@ class KnownRule(Rule):
         """ Try to get information about the sample from the database. Return
         the old result and reason if found and advise the engine to stop
         processing. """
-        ktreport = await self.get_knowntools_report(sample)
-        if ktreport.known:
-            result, reason = ktreport.worst()
-            return self.result(result, reason, False)
+        worst = await self.db_con.analysis_journal_get_worst(sample)
+        if worst is not None:
+            return self.result(worst['result'], worst['reason'], False)
 
         return self.result(Result.unknown,
                            _("File is not yet known to the system"),

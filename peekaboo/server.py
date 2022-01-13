@@ -34,6 +34,7 @@ import sanic
 import sanic.headers
 import sanic.response
 
+from .ruleset import Result
 from peekaboo.db import PeekabooDatabaseError
 from peekaboo.sample import Sample
 
@@ -81,7 +82,7 @@ class PeekabooServer:
         self.app.add_route(self.ping, '/ping')
         self.app.add_route(self.scan, "/v1/scan", methods=['POST'])
         self.app.add_route(
-            self.report, '/v1/report/<job_id:int>', methods=['GET'])
+            self.report, '/v1/report/<job_id:uuid>', methods=['GET'])
 
     async def hello(self, _):
         """ hello endpoint as fallback and catch all
@@ -229,7 +230,7 @@ class PeekabooServer:
                 {'message': 'Error submitting sample to job queue'}, 500)
 
         # send answer to client
-        return sanic.response.json({'job_id': sample.id}, 200)
+        return sanic.response.json({'job_id': str(sample.id)}, 200)
 
     async def report(self, _, job_id):
         """ report endpoint for report retrieval by job ID
@@ -237,7 +238,7 @@ class PeekabooServer:
         @param request: sanic request object
         @type request: sanic.Request
         @param job_id: job ID extracted from endpoint path
-        @type job_id: int
+        @type job_id: uuid.UUID
         @returns: report json response
         """
         if not job_id:
@@ -254,16 +255,15 @@ class PeekabooServer:
                             'from database'}, 500)
 
         if job_info is None:
-            logger.debug('No analysis result yet for job %d', job_id)
+            logger.debug('No analysis result yet for job %s', job_id)
             return sanic.response.json(
-                {'message': 'No analysis result yet for job %d' % job_id}, 404)
+                {'message': 'No analysis result yet for job %s' % job_id}, 404)
 
-        reason, result = job_info
         return sanic.response.json({
-            'result': result.name,
-            'reason': reason,
+            'result': Result(job_info['result']).name,
+            'reason': job_info['reason'],
             # FIXME: depends on saving the report to the database
-            # 'report': report,
+            'report': job_info['report'],
             }, 200)
 
     async def start(self):
