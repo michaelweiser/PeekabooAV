@@ -299,7 +299,8 @@ class PeekabooDatabase:
                  stored in the journal.
         """
         return await self.analysis_journal_query(sample, dict(
-            sort=[dict(analysis_time='asc')]))
+            sort=[dict(analysis_time='asc')],
+            use_index='analysis_time-asc-json-index'))
 
     async def analysis_journal_get_last(self, sample):
         """
@@ -312,7 +313,8 @@ class PeekabooDatabase:
                  requested sample.
         """
         return await self.analysis_journal_query(sample, dict(
-            sort=[dict(analysis_time='desc')]))
+            sort=[dict(analysis_time='desc')],
+            use_index='analysis_time-desc-json-index'))
 
     async def analysis_journal_get_worst(self, sample):
         """
@@ -325,7 +327,8 @@ class PeekabooDatabase:
                  requested sample.
         """
         return await self.analysis_journal_query(sample, dict(
-            sort=[dict(result_numeric='desc')]))
+            sort=[dict(result_numeric='desc')],
+            use_index='result_numeric-desc-json-index'))
 
     async def analysis_retrieve(self, job_id):
         """
