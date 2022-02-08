@@ -28,6 +28,7 @@
 """ The peekaboo-util command line interface. """
 
 import argparse
+import base64
 import json
 import logging
 import os
@@ -90,43 +91,65 @@ class PeekabooUtil:
         for filename in args.filename:
             logger.debug('Submitting file %s', filename)
 
-            content_type = None
+            # key names must match json endpoint definition
+            submit = {
+                'file-name': os.path.basename(filename)
+            }
+
             if args.content_type:
                 ct_popped = args.content_type.pop(0)
                 # empty string is treated as no selection to allow specificaion
                 # for later file arguments still
                 if ct_popped:
-                    content_type = ct_popped
-                    logger.debug('Using content type %s', content_type)
+                    submit['content-type'] = ct_popped
+                    logger.debug('Using content type %s', ct_popped)
 
-            content_disposition = None
             if args.content_disposition:
                 cd_popped = args.content_disposition.pop(0)
                 if cd_popped:
-                    content_disposition = cd_popped
+                    submit['content-disposition'] = cd_popped
                     logger.debug(
-                        'Using content disposition %s', content_disposition)
+                        'Using content disposition %s', cd_popped)
 
+            response = None
             with open(filename, 'rb') as upload_file:
-                submit_name = os.path.basename(filename)
-                files = {'file': (submit_name, upload_file, content_type)}
-                headers = {'x-content-disposition': content_disposition}
+                if args.use_json_endpoint:
+                    submit['sample'] = base64.b64encode(
+                        upload_file.read()).decode('ascii')
+                else:
+                    files = {
+                        'file': (
+                            # since we're using the file handle for upload, we
+                            # need to do the request inside the context handler
+                            # as well
+                            submit.get('file-name'), upload_file,
+                            submit.get('content-type'))}
 
-                # NOTE: As of this writing, requests via urllib3 1.26.x encodes
-                # filenames according to a WHATWG HTML5 spec draft using
-                # percent encoding and backslash escaping. Peekaboo via sanic
-                # only supports part of the current WHATWG HTML5 spec (no
-                # longer draft) by reverting double quote escaping (%22 -> ").
-                # We cannot (without serious hacking) switch requests to use
-                # RFC2231 encoding from here. Therefore filenames containing
-                # special characters can not currently be correctly transferred
-                # using this command. urllib3 has already been adjusted to
-                # default to the current version of the HTML5 escaping scheme.
-                # So sanic hopefully doing the same there's a chance this will
-                # sort itself out by itself eventually.
+                    headers = {}
+                    cdisp = submit.get('content-disposition')
+                    if cdisp is not None:
+                        headers['x-content-disposition'] = cdisp
+
+                    # NOTE: As of this writing, requests via urllib3 1.26.x
+                    # encodes filenames according to a WHATWG HTML5 spec draft
+                    # using percent encoding and backslash escaping. Peekaboo
+                    # via sanic only supports part of the current WHATWG HTML5
+                    # spec (no longer draft) by reverting double quote escaping
+                    # (%22 -> ").  We cannot (without serious hacking) switch
+                    # requests to use RFC2231 encoding from here. Therefore
+                    # filenames containing special characters can not currently
+                    # be correctly transferred using this command. urllib3 has
+                    # already been adjusted to default to the current version
+                    # of the HTML5 escaping scheme.  So sanic hopefully doing
+                    # the same there's a chance this will sort itself out by
+                    # itself eventually.
+                    response = requests.post(urllib.parse.urljoin(
+                        self.url, '/v1/scan'), files=files, headers=headers,
+                        timeout=self.timeout)
+
+            if args.use_json_endpoint:
                 response = requests.post(urllib.parse.urljoin(
-                    self.url, '/v1/scan'), files=files, headers=headers,
-                    timeout=self.timeout)
+                    self.url, '/v1/scan2'), json=submit, timeout=self.timeout)
 
             json_resp = response.json()
             job_id = json_resp.get('job_id')
@@ -246,6 +269,9 @@ def main():
         '-o', '--content-disposition', action='append', required=False,
         help='Content disposition of file to scan. Can be given more than '
         'once and has to match the file list in order.')
+    scan_file_parser.add_argument(
+        '-J', '--use-json-endpoint', action='store_true', required=False,
+        help='Use the alternative JSON endpoint to submit the job.')
 
     scan_file_parser.set_defaults(func=PeekabooUtil.scan_file)
 

@@ -26,6 +26,8 @@
 client. """
 
 import asyncio
+import base64
+import binascii
 import email.utils
 import logging
 import urllib.parse
@@ -33,6 +35,7 @@ import urllib.parse
 import sanic
 import sanic.headers
 import sanic.response
+import schema
 
 from peekaboo.db import PeekabooDatabaseError
 
@@ -83,6 +86,7 @@ class PeekabooServer:
         self.app.add_route(self.hello, '/')
         self.app.add_route(self.ping, '/ping')
         self.app.add_route(self.scan, "/v1/scan", methods=['POST'])
+        self.app.add_route(self.scan2, "/v1/scan2", methods=['POST'])
         self.app.add_route(
             self.report, '/v1/report/<job_id:int>', methods=['GET'])
 
@@ -216,6 +220,68 @@ class PeekabooServer:
 
         file_content = form_part[line_index:-4]
         content_disposition = request.headers.get('x-content-disposition')
+        return await self.submit(file_content, file_name, content_type,
+                                 content_disposition)
+
+    async def scan2(self, request):
+        """ scan endpoint for job submission using JSON structure to describe
+        job
+
+        @param request: sanic request object
+        @type request: sanic.Request
+        @returns: json response containing ID of newly created job
+        """
+        try:
+            upload = schema.Schema({
+                # RFC4648, no newlines, allow empty file
+                'sample': schema.And(str, schema.Regex(r'^[A-Za-z0-9+/=]*$')),
+                schema.Optional('file-name'): str,
+                # RFC2183: 'attachment', 'inline' or any extension-token, the
+                # latter being defined in RFC2045 as 1*<any (US-ASCII (RFC822
+                # 0-127 decimal)) CHAR (32 decimal) except SPACE, CTLs (0-31
+                # and 127 decimal), or tspecials with tspecials being "(" / ")"
+                # / "<" / ">" / "@" / "," / ";" / ":" / "\" / <"> "/" / "[" /
+                # "]" / "?" / "="
+                schema.Optional('content-disposition'): schema.And(
+                    str, schema.Regex(r'^[!#$%&\'*+-\.0-9<>A-Z^_`a-z~]+$')),
+                # RFC2045: type "/" subtype with both possibly being extension
+                # tokens
+                schema.Optional('content-type'): schema.And(
+                    str, schema.Regex(r'^[!#$%&\'*+-\./0-9<>A-Z^_`a-z~]+$')),
+                }).validate(request.json)
+        except schema.SchemaError as error:
+            logger.warning("Invalid scan2 request: %s", error)
+            return sanic.response.json(
+                {'message': 'Invalid request'}, 400)
+
+        try:
+            file_content = base64.b64decode(upload['sample'], validate=True)
+        except binascii.Error as error:
+            logger.warning(
+                "Invalid base64 encoding of sample content: %s", error)
+            return sanic.response.json(
+                {'message': 'Invalid base64 encoding of sample content'}, 400)
+
+        file_name = upload.get('file-name')
+        content_type = upload.get('content-type')
+        content_disposition = upload.get('content-disposition')
+        return await self.submit(file_content, file_name, content_type,
+                                 content_disposition)
+
+    async def submit(self, file_content, file_name, content_type,
+                     content_disposition):
+        """ Create and submit a sample as helper for scan endpoints.
+
+        @param file_content: decoded binary sample file content
+        @type file_content: bytes
+        @param file_name: decoded file name
+        @type file_name: str
+        @param content_type: sample file content type
+        @type content_type: str
+        @param content_disposition: original sample content disposition from
+                                    email
+        @type content_disposition: str
+        """
         sample = self.sample_factory.make_sample(
             file_content, file_name,
             content_type, content_disposition)
