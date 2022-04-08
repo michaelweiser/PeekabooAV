@@ -26,11 +26,15 @@
 
 import asyncio
 import datetime
+import json
 import logging
+import time
+import urllib
 import uuid
 
 import aiocouch
 import aiohttp
+import schema
 import tenacity
 
 from .ruleset import Result
@@ -38,6 +42,14 @@ from .sample import JobState
 from .exceptions import PeekabooDatabaseError
 
 logger = logging.getLogger(__name__)
+
+
+CASE_STATUS_TO_JOB_STATE = {
+    "Open": JobState.ACCEPTED,
+    "Resolved": JobState.FINISHED,
+    "Deleted": JobState.FINISHED,
+    "Duplicate": JobState.FINISHED,
+}
 
 
 def retry_if_connection_refused(retry_state):
@@ -57,7 +69,9 @@ def log_retry(retry_state):
 class PeekabooDatabase:
     """ Peekaboo's database. """
     def __init__(self, url, db_prefix, user, password, instance_id=0,
-                 stale_in_flight_threshold=15*60):
+                 stale_in_flight_threshold=15*60,
+                 thehive_url="http://localhost:9000", api_token="", retries=5,
+                 backoff=0.5):
         """
         Initialize the Peekaboo database handler.
 
@@ -72,6 +86,14 @@ class PeekabooDatabase:
                             to worry about.
         @param stale_in_flight_threshold: Number of seconds after which a in
         flight marker is considered stale and deleted or ignored.
+        @param thehive_url: Where to reach the TheHive REST API
+        @type thehive_url: string
+        @param api_token: API token to use for authentication
+        @type api_token: string
+        @param retries: Number of retries on API requests
+        @type retries: int
+        @param backoff: Backoff factor for urllib3
+        @type backoff: float
         """
         # remember for diagnostics
         self.url = url
@@ -109,47 +131,81 @@ class PeekabooDatabase:
         self.analyses_db = aiocouch.Database(self.client, self.analyses_name)
         self.in_flight_db = aiocouch.Database(self.client, self.in_flight_name)
 
+        self.thehive_retrier = tenacity.AsyncRetrying(
+                stop=tenacity.stop_after_attempt(retries),
+                wait=tenacity.wait_exponential(multiplier=backoff),
+                retry=tenacity.retry_if_exception_type(aiohttp.ClientError),
+                before_sleep=log_retry)
+
+        api_token = 'cct78qgRcdW2s4my50w0ZkRq7iAyLFZ8'
+        headers = {'Authorization': f'Bearer {api_token}'}
+        self.session = aiohttp.ClientSession(
+            raise_for_status=True, headers=headers)
+        self.thehive_url = thehive_url
+        self.case_schema = schema.Schema({
+                'caseId': int,
+                'status': schema.Or('Open', 'Resolved', 'Deleted', 'Duplicate'),
+                'startDate': int,
+                'customFields': schema.Schema({
+                        schema.Or(
+                                #'peekaboo-analysis-state',
+                                'peekaboo-analysis-sha256sum',
+                                'peekaboo-analysis-result',
+                                'peekaboo-analysis-file-extension'): {
+                            'string': str,
+                            'order': schema.Or(None, int),
+                        },
+                        'peekaboo-analysis-result-numeric': {
+                            'integer': int,
+                            'order': schema.Or(None, int),
+                        },
+                        schema.Optional('peekaboo-analysis-reason'): {
+                            'string': str,
+                            'order': schema.Or(None, int),
+                        },
+                        schema.Optional('peekaboo-analysis-report'): {
+                            'string': str,
+                            'order': schema.Or(None, int),
+                        },
+                        schema.Optional('peekaboo-analysis-cuckoo'): {
+                            'string': str,
+                            'order': schema.Or(None, int),
+                        },
+                    }, ignore_extra_keys=True),
+            }, ignore_extra_keys=True)
+
+        self.journal_schema = schema.Schema([{
+                'number': int,
+                'status': schema.Or('Open', 'Resolved', 'Deleted', 'Duplicate'),
+                'startDate': int,
+                'customFields': [
+                    schema.Schema({
+                            'name': schema.Or(
+                                #'peekaboo-analysis-state',
+                                'peekaboo-analysis-sha256sum',
+                                'peekaboo-analysis-result',
+                                'peekaboo-analysis-file-extension'),
+                            'type': 'string',
+                            'value': str,
+                        }, ignore_extra_keys=True),
+                    schema.Schema({
+                            'name': 'peekaboo-analysis-result-numeric',
+                            'type': 'integer',
+                            'value': int,
+                        }, ignore_extra_keys=True),
+                    schema.Optional({
+                            'name': schema.Or(
+                                'peekaboo-analysis-reason',
+                                'peekaboo-analysis-report',
+                                'peekaboo-analysis-cuckoo'),
+                            'type': 'string',
+                            'value': str,
+                        }, ignore_extra_keys=True),
+                ]
+            }], ignore_extra_keys=True)
+
     async def start(self):
         """ Start the database. """
-        #try:
-        #    async for attempt in self.connect_retrier:
-        #        with attempt:
-        #            logger.debug('Validating database credentials')
-        #            await self.client.check_credentials()
-
-                    # FIXME: Only Admins can create databases and indices :(
-                    #logger.debug('Creating analyses database')
-                    #self.analyses_db = await self.client.create(
-                    #    self.analyses_name, exists_ok=True)
-                    #await self.create_index(
-                    #    self.analyses_name, "analysis_time")
-                    #await self.create_index(
-                    #    self.analyses_name, "result_numeric")
-
-                    #logger.debug('Creating in-flight sample database')
-                    #self.in_flight_db = await self.client.create(
-                    #    self.in_flight_name, exists_ok=True)
-                    # FIXME: Create index here
-        #except aiocouch.UnauthorizedError as error:
-        #    await self.client.close()
-        #    raise PeekabooDatabaseError(
-        #        f'Unauthorized when trying to access database at {self.url}. '
-        #        'Check credentials and permissions.') from error
-        #except tenacity.RetryError as error:
-        #    # retries expired
-        #    await self.client.close()
-        #    raise PeekabooDatabaseError(
-        #        f'Initial connection to database at {self.url} '
-        #        'failed') from error
-
-    #async def create_index(self, db, field):
-    #    """ Create an index for a field in the database. """
-    #    return await self.client._server._post(f"/{db}/_index", data={
-    #       "index": {
-    #          "fields": [field],
-    #       },
-    #       "name": f"{field}-json-index",
-    #       "type": "json"})
 
     async def analysis_add(self, sample):
         """
@@ -159,49 +215,42 @@ class PeekabooDatabase:
         @returns: ID of the newly created analysis task (also updated
                   in the sample)
         """
-        utcnow = datetime.datetime.now(datetime.timezone.utc)
-        sample_info = dict(
-            state=sample.state.name,
-            sha256sum=await sample.sha256sum,
-            file_extension=sample.file_extension,
-            analysis_time=utcnow.isoformat(),
-            result=sample.result.name,
-            # purely for ordering reasons in find queries, particularly worst
-            # result
-            result_numeric=sample.result.value)
+        request_url = urllib.parse.urljoin(self.thehive_url, '/api/case')
+        analysis = {
+            'title': 'Peekaboo Analysis',
+            'description': 'Peekaboo Analysis',
+            'tags': ['peekaboo-analysis'],
+            # case id and analysis time are auto-generated upon creation
+            'customFields': {
+                #'peekaboo-analysis-state': sample.state.name,
+                'peekaboo-analysis-sha256sum': await sample.sha256sum,
+                'peekaboo-analysis-file-extension': sample.file_extension,
+                'peekaboo-analysis-result': sample.result.name,
+                # purely for ordering reasons in find queries, particularly
+                # worst result
+                'peekaboo-analysis-result-numeric': sample.result.value
+            },
+        }
 
         try:
-            async for attempt_connect in self.connect_retrier:
+            async for attempt_connect in self.thehive_retrier:
                 with attempt_connect:
-                    async for attempt_conflict in self.conflict_retrier:
-                        with attempt_conflict:
-                            # force dashed hex format by explicit string
-                            # conversion
-                            docid = uuid.uuid4()
-                            doc = aiocouch.Document(
-                                self.analyses_db, str(docid), data=sample_info)
-                            await doc.save()
-                            sample.update_id(docid)
-                            return docid
+                    async with self.session.post(
+                            request_url, json=analysis) as response:
+                        response = await response.json()
+                        case = self.case_schema.validate(response)
+                        case_id = case['caseId']
+                        sample.update_id(case_id)
+                        return case_id
+        except (ValueError, schema.SchemaError) as error:
+            raise PeekabooDatabaseError(
+                'Invalid JSON in response when creating analysis case: '
+                f'{error}') from error
         except tenacity.RetryError as error:
             # retries expired
             raise PeekabooDatabaseError(
-                'Failed to add analysis task to the database: '
+                'Failed to add analysis case to the TheHive: '
                 f'{error}') from error
-
-    def db_to_internal(self, doc):
-        # TODO: more schema validation
-        return dict(
-            id=doc['_id'],
-            state=JobState[doc['state']],
-            sha256sum=doc['sha256sum'],
-            file_extension=doc['file_extension'],
-            analysis_time=datetime.datetime.fromisoformat(
-                doc['analysis_time']),
-            result=Result[doc['result']],
-            reason=doc.get('reason'),
-            report=doc.get('report'),
-            cuckoo_report=doc.get('cuckoo_report'))
 
     async def analysis_update(self, sample):
         """
@@ -209,47 +258,74 @@ class PeekabooDatabase:
 
         @param sample: The sample object for this analysis task.
         """
-        try:
-            async for attempt_connect in self.connect_retrier:
-                with attempt_connect:
-                    analysis = await self.analyses_db[str(sample.id)]
-                    analysis.update(dict(
-                        state=sample.state.name,
-                        #sha256sum=await sample.sha256sum,
-                        #file_extension=sample.file_extension,
-                        #analysis_time=utcnow.isoformat(),
-                        result=sample.result.name,
-                        # purely for ordering reasons in find queries, particularly worst
-                        # result
-                        result_numeric=sample.result.value,
-                        reason=sample.reason,
-                        report=sample.peekaboo_report))
+        request_url = urllib.parse.urljoin(
+            self.thehive_url, f'/api/case/{sample.id}')
 
-                    if sample.cuckoo_report is not None:
-                        analysis['cuckoo'] = sample.cuckoo_report.dump
-                    #if sample.cortex_report is not None:
-                    #    analysis['cortex'] = sample.cortex_report
-                    #if sample.filetools_report is not None:
-                    #    analysis['filetools'] = sample.filetools_report
-                    #if sample.oletools_report is not None:
-                    #    analysis['oletools'] = sample.oletools_report
-                    #if sample.knowntools_report is not None:
-                    #    analysis['knowntools'] = sample.knowntools_report
-                    await analysis.save()
+        update = {
+            #'customFields.peekaboo-analysis-state.string':
+            #    sample.state.name,
+            #'customFields.peekaboo-analysis-sha256sum.string':
+            #    await sample.sha256sum,
+            #'customFields.peekaboo-analysis-file-extension.string':
+            #    sample.file_extension,
+            'customFields.peekaboo-analysis-result.string':
+                sample.result.name,
+            # purely for ordering reasons in find queries, particularly
+            # worst result
+            'customFields.peekaboo-analysis-result-numeric.integer':
+                sample.result.value,
+            'customFields.peekaboo-analysis-reason.string': sample.reason,
+            'customFields.peekaboo-analysis-report.string':
+                json.dumps(sample.peekaboo_report),
+        }
+
+        # map job state to case status
+        if sample.state == JobState.FINISHED:
+            update['status'] = 'Resolved'
+            update['summary'] = 'Analysis concluded'
+            update['impactStatus'] = 'NotApplicable'
+            update['resolutionStatus'] = 'Indeterminate'
+
+            if sample.result == Result.bad:
+                update['resolutionStatus'] = 'TruePositive'
+                update['impactStatus'] = 'NoImpact'
+
+        if sample.cuckoo_report is not None:
+            update['customFields.peekaboo-analysis-cuckoo.string'
+                ] = json.dumps(sample.cuckoo_report.dump)
+        #if sample.cortex_report is not None:
+        #    update['cortex'] = sample.cortex_report
+        #if sample.filetools_report is not None:
+        #    update['filetools'] = sample.filetools_report
+        #if sample.oletools_report is not None:
+        #    update['oletools'] = sample.oletools_report
+        #if sample.knowntools_report is not None:
+        #    update['knowntools'] = sample.knowntools_report
+
+        try:
+            async for attempt_connect in self.thehive_retrier:
+                with attempt_connect:
+                    async with self.session.patch(
+                            request_url, json=update) as response:
+                        await response.json()
 
                     # attach the sample in case it is malware
-                    if sample.result == Result.bad:
-                        attachment = analysis.attachment("sample")
+                    #if sample.result == Result.bad:
+                    #    attachment = analysis.attachment("sample")
                         # do not use client-supplied content type here to avoid
                         # attampts of confusing CouchDB. Instead we simply save
                         # some bytes here and metadata such as the content type
                         # claimed by the client is part of the report.
-                        await attachment.save(
-                            sample.content, "application/octet-stream")
+                    #    await attachment.save(
+                    #        sample.content, "application/octet-stream")
+        except (ValueError, schema.SchemaError) as error:
+            raise PeekabooDatabaseError(
+                'Invalid JSON in response when updating analysis case: '
+                f'{error}') from error
         except tenacity.RetryError as error:
             raise PeekabooDatabaseError(
-                f'{sample.id}: Failed to update analysis task in the '
-                f'database: {error}') from error
+                f'{sample.id}: Failed to update analysis case in the '
+                f'TheHive: {error}') from error
 
     async def analysis_journal_query(self, sample, query_update={}):
         """ Find entries in the analysis journal based on a base query
@@ -264,29 +340,92 @@ class PeekabooDatabase:
                  representation back into our internal schema (i.e. Enums and
                  datetime objects).
         """
-        query = dict(
-            selector=dict(
-                _id={'$ne': str(sample.id)},
-                result={'$ne': Result.failed.name},
-                state=JobState.FINISHED.name,
-                sha256sum=await sample.sha256sum,
-                file_extension=sample.file_extension))
-        query.update(query_update)
+        request_url = urllib.parse.urljoin(
+            self.thehive_url, '/api/v1/query?name=cases')
+
+        query = [
+            {
+                '_name': 'listCase',
+            },
+            {
+                '_name': 'filter',
+                '_and': [
+                    {
+                        '_field': 'tags',
+                        '_value': 'peekaboo-analysis',
+                    }, {
+                        '_not': {
+                            '_field': 'number',
+                            '_value': sample.id,
+                        },
+                    }, {
+                        '_not': {
+                            '_field': 'customFields.peekaboo-analysis-result',
+                            '_value': Result.failed.name,
+                        },
+                    }, {
+                        '_field': 'status',
+                        '_value': 'Resolved',
+                    }, {
+                        '_field': 'customFields.peekaboo-analysis-sha256sum',
+                        '_value': await sample.sha256sum,
+                    }, {
+                        '_field': 'customFields.peekaboo-analysis-file-extension',
+                        '_value': sample.file_extension,
+                    }
+                ],
+            }
+        ]
+
+        query.extend(query_update)
 
         try:
-            async for attempt_connect in self.connect_retrier:
+            async for attempt_connect in self.thehive_retrier:
                 with attempt_connect:
-                    # because we want to provide selector and sort criteria
-                    # from dict we need to supply it as kwargs
-                    async for doc in self.analyses_db.find(**query):
-                        return self.db_to_internal(doc)
+                    async with self.session.post(
+                            request_url, json={'query': query}) as response:
+                        response = await response.json()
+                        cases = self.journal_schema.validate(response)
+        except (ValueError, schema.SchemaError) as error:
+            raise PeekabooDatabaseError(
+                'Invalid JSON in response when fetching analysis journal: '
+                f'{error}') from error
         except tenacity.RetryError as error:
             raise PeekabooDatabaseError(
                 'Failed to fetch analysis journal from the database: '
                 f'{error}') from error
 
-        # reached if no documents are found
-        return None
+        if not cases:
+            return None
+
+        case = cases[0]
+        analysis = dict(
+            id=case['number'],
+            analysis_time=time.gmtime(case['startDate']),
+            state=CASE_STATUS_TO_JOB_STATE[case['status']])
+
+        for field in case['customFields']:
+            # this is sane because of schema validation done before
+            prop = field['name'].replace('peekaboo-analysis-', '')
+            value = field['value']
+
+            if prop in ['report', 'cuckoo']:
+                try:
+                    analysis[prop] = json.loads(value)
+                except ValueError as error:
+                    raise PeekabooDatabaseError(
+                        'Invalid report JSON in case when fetching journal: '
+                        f'{error}') from error
+
+                continue
+
+            if prop == 'result':
+                analysis[prop] = Result[value]
+                continue
+
+            analysis[prop] = value
+
+        return analysis
 
     async def analysis_journal_get_first(self, sample):
         """
@@ -298,9 +437,17 @@ class PeekabooDatabase:
         @return: A dict containing the attributes of the requested sample as
                  stored in the journal.
         """
-        return await self.analysis_journal_query(sample, dict(
-            sort=[dict(analysis_time='asc')],
-            use_index='analysis_time-asc-json-index'))
+        return await self.analysis_journal_query(sample, [
+            {
+                '_name': 'sort',
+                '_fields': [{
+                    'startDate': 'asc',
+                }],
+            }, {
+                '_name': 'page',
+                'from': 0,
+                'to': 1,
+            }])
 
     async def analysis_journal_get_last(self, sample):
         """
@@ -312,9 +459,16 @@ class PeekabooDatabase:
         @return: A dict containing id, result, reason and report of the
                  requested sample.
         """
-        return await self.analysis_journal_query(sample, dict(
-            sort=[dict(analysis_time='desc')],
-            use_index='analysis_time-desc-json-index'))
+        return await self.analysis_journal_query(sample, [{
+                '_name': 'sort',
+                '_fields': [{
+                    'startDate': 'desc',
+                }],
+            }, {
+                '_name': 'page',
+                'from': 0,
+                'to': 1,
+            }])
 
     async def analysis_journal_get_worst(self, sample):
         """
@@ -326,9 +480,16 @@ class PeekabooDatabase:
         @return: A dict containing id, result, reason and report of the
                  requested sample.
         """
-        return await self.analysis_journal_query(sample, dict(
-            sort=[dict(result_numeric='desc')],
-            use_index='result_numeric-desc-json-index'))
+        return await self.analysis_journal_query(sample, [{
+                '_name': 'sort',
+                '_fields': [{
+                    'customFields.peekaboo-analysis-result-numeric': 'desc',
+                }],
+            }, {
+                '_name': 'page',
+                'from': 0,
+                'to': 1,
+            }])
 
     async def analysis_retrieve(self, job_id):
         """
@@ -338,21 +499,54 @@ class PeekabooDatabase:
         @type job_id: uuid.UUID
         @return: reason and result for the given analysis task
         """
-        query = dict(
-            _id=str(job_id), state=JobState.FINISHED.name)
+        request_url = urllib.parse.urljoin(
+            self.thehive_url, f'/api/case/{job_id}')
 
         try:
-            async for attempt_connect in self.connect_retrier:
+            async for attempt_connect in self.thehive_retrier:
                 with attempt_connect:
-                    async for doc in self.analyses_db.find(query):
-                        return self.db_to_internal(doc)
+                    async with self.session.get(
+                            request_url) as response:
+                        response = await response.json()
+                        case = self.case_schema.validate(response)
+        except (ValueError, schema.SchemaError) as error:
+            raise PeekabooDatabaseError(
+                'Invalid JSON in response when retrieving analysisc: '
+                f'{error}') from error
         except tenacity.RetryError as error:
             raise PeekabooDatabaseError(
                 f'{sample.id}: Failed to retrieve analysis from the '
                 f'database: {error}') from error
 
-        # reached if analysis matching criterion is not found
-        return None
+        analysis = dict(
+            id=case['caseId'],
+            state=CASE_STATUS_TO_JOB_STATE[case['status']],
+            sha256sum=case['customFields'][
+                'peekaboo-analysis-sha256sum']['string'],
+            file_extension=case['customFields'][
+                'peekaboo-analysis-file-extension']['string'],
+            analysis_time=time.gmtime(case['startDate']),
+            result=Result[case['customFields'][
+                'peekaboo-analysis-result']['string']],
+            reason=case['customFields'].get(
+                'peekaboo-analysis-reason', {}).get('string'))
+
+        try:
+            report = case['customFields'].get(
+                'peekaboo-analysis-report', {}).get('string')
+            if report is not None:
+                analysis['report'] = json.loads(report)
+
+            cuckoo_report = case['customFields'].get(
+                'peekaboo-analysis-cuckoo', {}).get('string')
+            if cuckoo_report is not None:
+                analysis['cuckoo_report'] = json.loads(cuckoo_report)
+        except ValueError as error:
+            raise PeekabooDatabaseError(
+                'Invalid report JSON in case when retrieving analysis: '
+                f'{error}') from error
+
+        return analysis
 
     async def mark_sample_in_flight(self, sample, instance_id=None, start_time=None):
         """
@@ -554,3 +748,4 @@ class PeekabooDatabase:
     async def close_down(self):
         """ Finally close down all resources and wait for it to finish. """
         await self.client.close()
+        await self.session.close()

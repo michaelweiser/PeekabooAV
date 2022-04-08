@@ -36,7 +36,7 @@ import sanic.response
 
 from .ruleset import Result
 from peekaboo.db import PeekabooDatabaseError
-from peekaboo.sample import Sample
+from .sample import JobState, Sample
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +82,7 @@ class PeekabooServer:
         self.app.add_route(self.ping, '/ping')
         self.app.add_route(self.scan, "/v1/scan", methods=['POST'])
         self.app.add_route(
-            self.report, '/v1/report/<job_id:uuid>', methods=['GET'])
+            self.report, '/v1/report/<job_id:int>', methods=['GET'])
 
     async def hello(self, _):
         """ hello endpoint as fallback and catch all
@@ -230,7 +230,7 @@ class PeekabooServer:
                 {'message': 'Error submitting sample to job queue'}, 500)
 
         # send answer to client
-        return sanic.response.json({'job_id': str(sample.id)}, 200)
+        return sanic.response.json({'job_id': sample.id}, 200)
 
     async def report(self, _, job_id):
         """ report endpoint for report retrieval by job ID
@@ -254,7 +254,7 @@ class PeekabooServer:
                 {'message': 'Failed to retrieve analysis result '
                             'from database'}, 500)
 
-        if job_info is None:
+        if job_info is None or job_info['state'] != JobState.FINISHED:
             logger.debug('No analysis result yet for job %s', job_id)
             return sanic.response.json(
                 {'message': 'No analysis result yet for job %s' % job_id}, 404)
@@ -262,8 +262,7 @@ class PeekabooServer:
         return sanic.response.json({
             'result': Result(job_info['result']).name,
             'reason': job_info['reason'],
-            # FIXME: depends on saving the report to the database
-            'report': job_info['report'],
+            'report': job_info.get('report'),
             }, 200)
 
     async def start(self):
