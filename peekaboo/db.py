@@ -302,6 +302,31 @@ class PeekabooDatabase:
         #if sample.knowntools_report is not None:
         #    update['knowntools'] = sample.knowntools_report
 
+        # attach the sample in case it is malware or analysis failed
+        if sample.result >= Result.failed:
+            attachment_url = urllib.parse.urljoin(
+                self.thehive_url, f'/api/v0/case/{sample.id}/artifact')
+
+            params = {
+                "dataType": "file",
+                "sighted": True,
+                "message": "sample",
+            }
+
+            payload = aiohttp.FormData()
+            payload.add_field('_json', json.dumps(params))
+            # do not use client-supplied content type here to avoid
+            # attampts of confusing CouchDB. Instead we simply save
+            # some bytes here and metadata such as the content type
+            # claimed by the client is part of the report.
+            payload.add_field(
+                'attachment', sample.content,
+                content_type="application/octet-stream",
+                filename=sample.filename)
+
+            # make reusable across retries
+            attachment = payload()
+
         try:
             async for attempt_connect in self.thehive_retrier:
                 with attempt_connect:
@@ -309,15 +334,12 @@ class PeekabooDatabase:
                             request_url, json=update) as response:
                         await response.json()
 
-                    # attach the sample in case it is malware
-                    #if sample.result == Result.bad:
-                    #    attachment = analysis.attachment("sample")
-                        # do not use client-supplied content type here to avoid
-                        # attampts of confusing CouchDB. Instead we simply save
-                        # some bytes here and metadata such as the content type
-                        # claimed by the client is part of the report.
-                    #    await attachment.save(
-                    #        sample.content, "application/octet-stream")
+            if sample.result >= Result.failed:
+                async for attempt_connect in self.thehive_retrier:
+                    with attempt_connect:
+                        async with self.session.post(
+                                attachment_url, data=attachment) as response:
+                            await response.json()
         except (ValueError, schema.SchemaError) as error:
             raise PeekabooDatabaseError(
                 'Invalid JSON in response when updating analysis case: '
