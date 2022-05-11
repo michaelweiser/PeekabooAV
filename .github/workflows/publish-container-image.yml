@@ -38,6 +38,7 @@ jobs:
 
       - name: Select Installer version
         run: |
+          echo "$GITHUB_REF" "$GITHUB_BASE_REF"
           # for pull requests decide which Installer version to use based on the
           # target branch
           if [ -z "${GITHUB_REF%refs/heads/*}" -a -n "$GITHUB_BASE_REF" ] ; then
